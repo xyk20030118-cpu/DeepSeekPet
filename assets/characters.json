@@ -1,0 +1,12 @@
+{
+ "characters": [
+  {
+   "id": "builtin:default",
+   "name": "默认角色（内置）",
+   "author": "DeepSeekPet",
+   "version": "8.0",
+   "builtin": true,
+   "note": "APK 内置：只有 1 个待机动作。导入「默认角色包」可获得完整动作套组。"
+  }
+ ]
+}

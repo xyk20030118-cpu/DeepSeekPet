@@ -1,0 +1,45 @@
+# 忽略规则
+#
+# 本仓库是从完整工程裁出来的发布副本：大二进制与签名库都被排除。
+# 想拿完整工程（含引擎载荷、模型、工具链）请下 Release 里的「项目移植包」。
+
+# 构建产物
+/dist/
+*.apk
+*.idsig
+*.aab
+*.ap_
+*.dex
+*.log
+
+# 签名密钥（绝不入库；正式版请自行生成）
+*.keystore
+*.jks
+*.p12
+
+# 大载荷（GitHub 单文件 100 MB 上限）
+/assets/engine/
+/assets/nodelibs/
+/lib/
+/model/
+/build/toolchain/
+/build/toolchain-pc/
+
+# 一次性编译/实验产物
+__pycache__/
+*.pyc
+*.class
+*.o
+*/out/
+/build/_*/
+/build/.src_snapshot/
+/build/release_src/
+/build/monitor_shots/
+
+# 本地环境
+.vscode/
+.idea/
+.local/
+*.bak
+*.tmp
+/tmp/

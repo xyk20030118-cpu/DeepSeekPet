@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- DeepSeekPet v8.0 (versionCode 80) 明文清单
+     由已安装 APK 的 AXML 反解而成，内容与原版逐字节等价。
+     改动后必须重新编译（build.sh 会自动处理）。 -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.deepseek.pet"
+    android:versionCode="80"
+    android:versionName="8.0"
+    android:compileSdkVersion="34"
+    android:compileSdkVersionCodename="14">
+
+    <uses-sdk
+        android:minSdkVersion="24"
+        android:targetSdkVersion="28" />
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- ★ 「访问所有文件」（Android 11+ 需要用户到系统设置里授权）。
+         用户报障（vivo）：应用设置里根本没有文件权限入口 ⇒ 工作模式打不开。
+         工作模式（harness 工作区）要读写用户选的文件夹，所以必须声明并主动申请。 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Shizuku：免 root 拿到 shell 权限，用于游戏助手读取前台应用的实时帧率。
+         注意这是**普通权限声明**，真正的授权由 Shizuku App 在运行期弹框确认
+         （见 ShizukuBridge.request），用户不装 Shizuku 也能正常用桌宠。 -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+
+    <!-- ★★ 包可见性（Android 11+ / API 30 起）：targetSdk 30+ 的应用默认**看不到**
+         别的应用，queryIntentActivities 只会返回自己 + 少数系统应用 ——
+         设置页第 8 节「选择应用」于是"读不到完整的应用列表"（模拟器实测只列出 2 个）。
+         声明"我要查带启动入口的应用"即可放开；**不需要** QUERY_ALL_PACKAGES
+         那种敏感权限（后者上架时还要额外说明）。 -->
+    <queries>
+        <!-- Android 11+ 包可见性：主 App 要查「DSH Linux 引擎」装没装 -->
+        <package android:name="com.deepseek.pet.linux" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:label="DeepSeek桌宠"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="true"
+        android:enableOnBackInvokedCallback="true"
+        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:extractNativeLibs="true">
+
+        <meta-data
+            android:name="dsp.variant"
+            android:value="开发版" />
+
+        <!-- ================= Shizuku =================
+             V3_SUPPORT 标记 + ShizukuProvider 是 Shizuku 客户端的两件必需品，
+             缺任何一个都会静默拿不到 binder（表现为"授权了但 pingBinder 一直 false"）。
+
+             ★ authorities 必须是 **应用包名 + .shizuku**，且 provider 内部会自己校验：
+               它会检查 android:multiprocess 必须 false、android:exported 必须 true，
+               不合规直接抛异常（这两个字符串实测来自 provider 的常量池）。
+             ★ 这里写的是开发版包名。正式版由 make_variant.py 把
+               com.deepseek.pet 整体替换成 com.doropet.release，
+               所以 authority 会跟着变成 com.doropet.release.shizuku —— 正确。
+               不能用 ${applicationId}：那是 Gradle 的占位符，aapt2 不认。 -->
+        <meta-data
+            android:name="moe.shizuku.client.V3_SUPPORT"
+            android:value="true" />
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.deepseek.pet.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false" />
+
+        <!-- excludeFromRecents：桌宠是常驻悬浮工具，设置页不该在最近任务里留卡片。
+             注意它只在「本任务首次创建」时生效；桌宠挂起来时还会用 AppTask 主动
+             把已在的卡片踢掉（见 FloatingService.kickSelfFromRecents）。 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".UsageActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Light.NoTitleBar" />
+
+        <!-- ★ 轮次79（DSH 移植 · 工作模式）：复刻桌面端 DeepSeek Harness 的页面与交互。
+             入口是陪伴模式顶部那张「模式」卡片；两个界面之间切换时播一次动画
+             （内置淡入/缩放/推入，或用户自己导入的视频）。
+             exported=false：同样只有本 App 能拉起。 -->
+        <!-- ★ 第十三版：工作模式的设置**独立一页**（对齐桌面端那个"设置"面板：
+             左侧分类、右侧内容）。入口在陪伴设置的「工作模式」那一行。 -->
+
+        <activity
+            android:name=".PlatformLoginActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@android:style/Theme.Light.NoTitleBar" />
+
+        <activity
+            android:name=".HistoryActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Light.NoTitleBar" />
+
+        <activity
+            android:name=".ChatActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
+            android:name=".QuickAskActivity"
+            android:exported="false"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustResize|adjustPan"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
+            android:name=".PermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:noHistory="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
+            android:name=".Vp9ProbeActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- 游戏助手链路探针（调试用，与 Vp9ProbeActivity 同性质）。
+             exported=true 才能用 adb 直接拉起验证；它只在**应用自身 UID** 下
+             跑本地 Binder 往返与状态判定，不提权、不读他人数据。 -->
+        <activity
+            android:name=".FpsProbeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- 本机 Linux（proot + Ubuntu + 官方 Node）：现在就在本 App 里，不再是第二个包 -->
+        <service
+            android:name=".dsh.linux.EngineService"
+            android:exported="false" />
+
+
+        <service
+            android:name=".dsh.DshHostService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="deepseek harness host" />
+        </service>
+
+        <service
+            android:name=".FloatingService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse|microphone">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="floating desktop pet overlay" />
+        </service>
+
+        <!-- Shizuku UserService：本类的方法**运行在 shell UID 的进程里**，
+             由 Shizuku 以 shell 身份拉起，所以里面的 Runtime.exec 天然是 shell 权限，
+             可以直接跑 dumpsys SurfaceFlinger（读帧率必需）。
+             ★ 必须 exported=false：它不需要被任何外部应用 bind，
+               拉起方是 Shizuku 自己的 shell 进程（走 app_process，不走常规 bind）。 -->
+        <service
+            android:name=".FpsUserService"
+            android:exported="false" />
+
+        <!-- 工作模式 = 上游 Harness 本体（宿主网页装在 WebView 里） -->
+        <activity
+            android:name=".DshHarnessActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:resizeableActivity="true"
+            android:documentLaunchMode="never"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.deepseek.pet.work"
+            android:label="DeepSeek 工作模式"
+            android:excludeFromRecents="false"
+            android:theme="@android:style/Theme.NoTitleBar" />
+
+        <!-- 一次性诊断（仅调试）：用 App 自己的 uid 在访客里跑 link 对照实验 -->
+        <receiver
+            android:name=".dsh.linux.LinkTestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.deepseek.pet.LINKTEST" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter android:priority="1000">
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".KeepAliveReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.deepseek.pet.KEEPALIVE_TICK" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 定时任务触发点：只收本 App 自己的闹钟（exported=false，外部伪造不了） -->
+        <receiver
+            android:name=".dsh.DshScheduleReceiver"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.deepseek.pet.dsh.SCHEDULE_RUN" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

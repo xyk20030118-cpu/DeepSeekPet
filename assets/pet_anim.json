@@ -1,0 +1,103 @@
+{
+ "version": 2,
+ "_note": "骨架期内置配置：APK 只带 1 个待机动作；完整 106 个动作在「默认角色包.zip」里，导入后由角色包提供。",
+ "scenes": {
+  "idle": {
+   "label": "待机",
+   "mode": "loop",
+   "pick": "first",
+   "clips": [
+    "待机呼吸休闲"
+   ]
+  },
+  "click": {
+   "label": "点击",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "interact": {
+   "label": "互动",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "drag": {
+   "label": "拖拽",
+   "mode": "loop",
+   "pick": "random",
+   "clips": []
+  },
+  "roam": {
+   "label": "漫游",
+   "mode": "loop",
+   "pick": "random",
+   "clips": []
+  },
+  "turn": {
+   "label": "转向",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "dock": {
+   "label": "贴边",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "pool": {
+   "label": "待机随机池",
+   "mode": "loop",
+   "pick": "weighted",
+   "clips": []
+  },
+  "hour": {
+   "label": "整点报时",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "festival": {
+   "label": "节日/节气",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "tap_head": {
+   "label": "点击头部",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "tap_body": {
+   "label": "点击身体",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "tap_tail": {
+   "label": "点击尾巴",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "double_tap": {
+   "label": "双击",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  },
+  "long_press": {
+   "label": "长按",
+   "mode": "once",
+   "pick": "random",
+   "clips": []
+  }
+ },
+ "events": {
+  "balance": [],
+  "whisper": [],
+  "workStatus": []
+ }
+}

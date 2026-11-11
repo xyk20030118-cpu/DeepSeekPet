@@ -1,0 +1,1112 @@
+本地 GGUF 引擎层 —— 构建溯源（轮次62 建立 · **轮次66 大改：加了 Vulkan 后端与 armv8.2 指令集**）
+================================================================================================
+
+这份文件回答一个问题：**现在 lib/arm64-v8a/ 里那几个 llama 相关 .so 是怎么来的。**
+下一个窗口要重编（换 llama.cpp 版本 / 升 NDK）时，照这里做即可。
+
+★★★ **轮次66 必读**：这一轮把 **Vulkan（GPU）后端** 编了进来，为此多出
+`libggml-vulkan.so`（strip 后 **约 20 MB**，APK 因此从 37.5 MB 涨到 56.6 MB），
+并且**改了三个"编了也白编"的接法**（见下面第八节）。
+★ 更重要的是：**在真机上走了三个只有真机才会暴露的坑**，全部记在第八节 ——
+照抄这一节能省一天。
+
+★★★ **轮次68 必读**：这一轮把「⚡ GPU 加速」做成**三态**（`off` / `auto` / `force`），
+默认 **force**（用户原话「强制使用gpu加速」），并把"强制失败"做成
+**不回落 CPU、把完整原因当面报给用户**（详见第十二节）。
+★ 这一轮**没有改 llama.cpp 任何一行** ⇒ 那三条本地补丁**不需要重打**，
+只要在重编 JNI 之前**核实它们还在**（第十二节给了逐条核实的命令与结果）。
+★ 重编的只有 `libdspllm.so`（71,320 字节）；其余 5 个库与轮次67 **逐字节相同**。
+
+★★ 轮次66 在 **llama.cpp 源码里打了两个本地补丁**（不是上游代码，重编必须重打）：
+* `ggml/src/ggml-vulkan/ggml-vulkan-buffers.cpp`：`std::aligned_alloc` → `posix_memalign`
+* `ggml/src/ggml-vulkan/ggml-vulkan.cpp`：三个 `vkGetPhysicalDeviceFeatures2` 直接调用
+  → 改成走运行时 dispatcher（详见第五、六节）
+  这两处都要**重打**，否则重编会失败（第一处编译错、第二处链接错）。
+★★ 轮次67 又加了**第三条本地补丁**（Adreno matvec 回退，`vendorID == 0x5143u`，见 11.2）
+⇒ 现在是**三条**，一个都不能少。
+`build/verify_local_llm.py` 会检查本文件存在且记着 commit / NDK 版本 / 源码包 sha256。
+
+一、取源码（★ 本机 GitHub 直连不通）
+-----------------------------------
+★★ 实测走过的路（诚实记录，别以为"计划走 gitee"就真走了 gitee）：
+
+| 路线 | 实测 | 用了吗 |
+|---|---|---|
+| `github.com` / `codeload.github.com` / `api.github.com` | **超时** | 没用 |
+| `gitee.com/lure_ai/llama.cpp`（ggml-org 的镜像） | 仓库页 **200**；`/raw/<ref>/<path>` **200**（能看单文件） | 只用来**查 tag 清单** |
+| gitee 的 `…/repository/archive/master.zip` | 返回 **45 KB 的 HTML 下载墙**（不是 zip） | ★ **没能用** |
+| **`ghproxy.net`**（GitHub 代理） | `…/archive/refs/heads/master.zip` → **200 + 真 ZIP(40 MB)** | ★★ **用的这个** |
+| `gh-proxy.com`（GitHub 代理） | 走 `api.github.com` **能拿到 commit sha** | ★ 用来定 commit |
+| `ghfast.top` | 下载可用（200 ZIP），但 api 走 403 | 备选 |
+| `kkgithub.com` / `gitclone.com` | 连接被拒 / 502 | 没用 |
+
+★ 结论（写给下一个窗口）：**"gitee 镜像"只适合浏览和查 tag，不适合下整包**；
+下整包走 `ghproxy.net`，要 commit sha 走 `gh-proxy.com` 转 `api.github.com`。
+
+* 仓库：`https://github.com/ggml-org/llama.cpp`
+* **commit：`b76b13379d3b7d67ab0bc424516bb6fd2522bd8e`**（commit date 2026-10-15）
+* 版本（源码 `CMakeLists.txt` 里）：**0.7.0-dev**
+* 下载 URL：
+  `https://ghproxy.net/https://github.com/ggml-org/llama.cpp/archive/b76b13379d3b7d67ab0bc424516bb6fd2522bd8e.zip`
+* 源码包 sha256：`34c0426ad4e0540ecb149c45433a227ca6fbef147937145c5bb3b5df8b31f595`
+
+★★ 为什么**按 commit 而不是按 master**：先下的 `refs/heads/master` 是
+40,098,380 字节，随后按 sha 下的同一份是 40,382,416 字节 —— **两次之间 master 前进了**。
+按 commit 锁死才能复现。
+
+二、装工具链
+-----------
+本机原本 **NDK / cmake / ninja / git 都没有**（`D:\Android\Sdk\ndk` 不存在）。
+
+```
+$env:JAVA_HOME='C:\Program Files\Microsoft\jdk-17.0.11.9-hotspot'
+D:\Android\Sdk\cmdline-tools\latest\bin\sdkmanager.bat --install "ndk;27.2.12479018" "cmake;3.31.6"
+```
+
+* NDK **27.2.12479018** → `D:\Android\Sdk\ndk\27.2.12479018`
+* CMake **3.31.6**（带 ninja 1.12.1）→ `D:\Android\Sdk\cmake\3.31.6\bin`
+* ★ 装了最新的 cmake 4.x 会踩"CMake 4 不再兼容 `cmake_minimum_required(<3.5)`"的坑，
+  所以挑 **3.31.6**（3.x 最后一档）。
+* ★ **ninja 必须放进 PATH**，不要用 `-DCMAKE_MAKE_PROGRAM=<路径>`：
+  本机 PowerShell 传这个 `-D` 时 CMake 收到的是**字面量 `$NINJA`**，
+  报 `Running '$NINJA' '--version' failed`（踩过）。
+
+三、交叉编译 llama.cpp（只编库，不编例子/工具/服务端）
+----------------------------------------------------
+源码目录 `LLAMA_SRC`、构建目录 `LLAMA_BUILD`（本机用的是 `D:\llamacpp_src\...`，
+**刻意放在工程树外** —— 40 MB 源码 + 构建产物不该进工程）。
+
+```
+PATH 前置 <cmake>/bin
+cmake -S <LLAMA_SRC> -B <LLAMA_BUILD> -G Ninja `
+  "-DCMAKE_TOOLCHAIN_FILE=D:/Android/Sdk/ndk/27.2.12479018/build/cmake/android.toolchain.cmake" `
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_shared `
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON `
+  -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_SERVER=OFF `
+  -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF `
+  -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_MTMD=OFF `
+  -DGGML_OPENMP=OFF -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF -DGGML_BACKEND_DL=OFF `
+  -DGGML_CPU_KLEIDIAI=OFF
+cmake --build <LLAMA_BUILD> --parallel 12
+```
+
+几个"为什么"（都是踩过或差点踩的）：
+* `GGML_OPENMP=OFF` —— 否则要跟着带 `libomp.so`（多一个依赖，收益很小，
+  ggml 自己的线程池已经覆盖主要算子）。
+* `GGML_CPU_KLEIDIAI=OFF` —— 它默认就是 OFF；开着会去 **FetchContent 拉 GitHub**（本机不通）。
+* `LLAMA_USE_PREBUILT_UI=OFF` / `LLAMA_OPENSSL=OFF` —— 都是"会去联网"的开关，一律关掉。
+* `ANDROID_PLATFORM=android-24`、`ANDROID_STL=c++_shared` —— 见 jni/CMakeLists.txt 里的说明
+  （多个 shared library 时 NDK 明说不支持各自静态链 libc++）。
+* 产出 4 个库：`libggml-base.so` / `libggml-cpu.so` / `libggml.so` / `libllama.so`
+  （`LLAMA_BUILD_MTMD=OFF` ⇒ 没有 libmtmd.so）。
+
+四、★ 一定要 strip
+-----------------
+`-DCMAKE_BUILD_TYPE=Release` **不带** strip，直接是 54 MB：
+
+| 库 | strip 前 | strip 后 |
+|---|---|---|
+| libllama.so | 42,435,704 | 3,744,056 |
+| libggml-base.so | 6,396,080 | 811,944 |
+| libggml-cpu.so | 5,058,392 | 927,840 |
+| libggml.so | 530,760 | 57,680 |
+| **合计** | **54.4 MB** | **5.28 MB** |
+
+```
+<NDK>/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-strip.exe --strip-unneeded <每个 .so>
+```
+
+五、编 JNI 包装
+--------------
+```
+cmake -S D:\petbuild\jni -B <JNI_BUILD> -G Ninja `
+  "-DCMAKE_TOOLCHAIN_FILE=D:/Android/Sdk/ndk/27.2.12479018/build/cmake/android.toolchain.cmake" `
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DANDROID_STL=c++_shared `
+  -DCMAKE_BUILD_TYPE=Release `
+  "-DLLAMA_SRC_DIR=<LLAMA_SRC>" "-DLLAMA_BUILD_DIR=<LLAMA_BUILD>"
+cmake --build <JNI_BUILD> --parallel 12
+<NDK>/.../llvm-strip.exe --strip-unneeded <JNI_BUILD>/libdspllm.so
+```
+`libdspllm.so` **只导出 6 个 `Java_com_deepseek_pet_LocalLlm_*` 符号**
+（`CXX_VISIBILITY_PRESET hidden` + JNIEXPORT），于是断言可以精确做三方一一对应：
+Java 源码 ↔ JNI 源码 ↔ 编出来的 .so 导出。
+
+六、进工程
+---------
+```
+copy <LLAMA_BUILD>/bin/libllama.so       D:\petbuild\lib\arm64-v8a\
+copy <LLAMA_BUILD>/bin/libggml.so        D:\petbuild\lib\arm64-v8a\
+copy <LLAMA_BUILD>/bin/libggml-cpu.so    D:\petbuild\lib\arm64-v8a\
+copy <LLAMA_BUILD>/bin/libggml-base.so   D:\petbuild\lib\arm64-v8a\
+copy <JNI_BUILD>/libdspllm.so            D:\petbuild\lib\arm64-v8a\
+copy <NDK>/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so D:\petbuild\lib\arm64-v8a\
+```
+★ 六个**一个都不能少** —— 依赖链是
+`libdspllm.so → libllama.so → {libggml.so, libggml-cpu.so, libggml-base.so} → libc++_shared.so`，
+少任何一个都是真机 dlopen 时才炸（`verify_local_llm.py` 会按 ELF 的 DT_NEEDED 逐条查，专门防漏）。
+★ `build/assemble.py` 是**通配收** `lib/arm64-v8a/*.so`（不是白名单）⇒ 不用改脚本。
+
+七、★ 本次读数（易变，别当判据用）
+-------------------------------
+| 文件 | 字节 |
+|---|---|
+| libllama.so | 3,744,056 |
+| libggml-cpu.so | 927,840 |
+| libggml-base.so | 811,944 |
+| libggml.so | 57,680 |
+| libdspllm.so | 49,352 |
+| libc++_shared.so | 1,794,776 |
+| 新装合计 | 7,385,648（≈7.04 MB） |
+
+八、★★★ 轮次66：加 Vulkan 后端 + armv8.2 指令集（**照这一节做**）
+----------------------------------------------------------------
+
+### 8.1 指令集（便宜、低风险、必做）
+
+原来没设任何 `-march`，走 NDK 默认的 **armv8-a** 基线 —— 量化矩阵乘最吃的
+**dotprod / fp16** 全没开。现在加：
+
+```
+-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+```
+
+* 变量名就是新版 llama.cpp 的 **`GGML_CPU_ARM_ARCH`**
+  （旧的 `LLAMA_CPU_ARM_ARCH` 已经不存在；ggml/CMakeLists.txt:184、ggml/src/ggml-cpu/CMakeLists.txt:210）。
+* ★ **为什么不上 i8mm**：i8mm 要 `armv8.6-a`，只有较新的 CPU 有；
+  本工程没有做"多版本 .so + 运行时挑"（那要 `GGML_CPU_ALL_VARIANTS=ON` + `GGML_BACKEND_DL=ON`，
+  而 BACKEND_DL 在 Android 上找不到后端目录，见 8.4）。
+  写进 `-march` 就会在**老设备上直接 SIGILL 崩**。**稳的底线就是 dotprod + fp16。**
+* `-O3` 不用加：`CMAKE_BUILD_TYPE=Release` 本来就带 `-O3 -DNDEBUG`（实测编译命令行里有）。
+* ★ 真机验证（`llama_print_system_info()`，现在会打进 logcat）：
+  `CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | DOTPROD = 1 | LLAMAFILE = 1 | REPACK = 1 |`
+
+### 8.2 Vulkan 后端：不用下 Vulkan SDK，但要三样东西
+
+`-DGGML_VULKAN=ON`（开关名确认过：ggml/CMakeLists.txt:224）。
+
+| 需要什么 | 从哪来 | 怎么接 |
+|---|---|---|
+| `glslc`（着色器编译器） | ★ **NDK 自带**：`<NDK>/shader-tools/windows-x86_64/glslc.exe`（shaderc v2022.3 / ndk-r26c） | `-DVulkan_GLSLC_EXECUTABLE=<那个路径>` |
+| Vulkan **C 头** + `libvulkan.so` stub | ★ NDK sysroot：`usr/include/vulkan/`（含 `vulkan_core.h`）、`usr/lib/aarch64-linux-android/24/libvulkan.so` | 不用管，CMake 的 FindVulkan 在 ANDROID 上自动找到（实测报 `found version "1.3.275"`） |
+| `vulkan.hpp`（C++ 绑定） | ★★ **NDK 里没有** | 从 `ghproxy.net` 下 `KhronosGroup/Vulkan-Headers` 的 **v1.3.275** tag，只把 `*.hpp` 拷到 `D:\spirv_headers\install\include\vulkan\`（**不要拷 `.h`**，那些留给 NDK sysroot） |
+| `SPIRV-Headers`（CMake 要 `find_package(... CONFIG REQUIRED)`） | `ghproxy.net` 下 `KhronosGroup/SPIRV-Headers` | 手写一个最小 `SPIRV-HeadersConfig.cmake` 放到 `D:\spirv_headers\install\share\cmake\SPIRV-Headers\` |
+| **host 编译器**（着色器生成工具 `vulkan-shaders-gen` 是跑在 PC 上的宿主程序） | ★★ 本机有 **Visual Studio 2026 Build Tools**（`C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools`） | 整个构建要在 **vcvars64 环境里**跑：`cmd /c "call vcvars64.bat && cmake ... && cmake --build ..."` |
+
+★ `vulkan.hpp` 的 include 路径靠 **`CPLUS_INCLUDE_PATH` 环境变量**给（比塞 `-DCMAKE_CXX_FLAGS`
+安全：后者会顶掉 NDK toolchain 的 `CMAKE_CXX_FLAGS_INIT`，实测会丢 `-fPIC` 一类东西）。
+
+★ 实测 glslc 太老 ⇒ 这些着色器扩展**一律被探测为不支持**（CMake 会打印
+`GL_KHR_cooperative_matrix not supported by glslc` 等 7 行）：
+coopmat / coopmat2 / integer_dot / bfloat16 / e2m1 / e4m3。
+**这不是错误**，是 `test_shader_extension_support()` 的正常降级路径；
+但**很可能正是真机上 Adreno 拒绝 pipeline 的原因**（见第八节末尾）。
+
+### 8.3 编译命令（实测可用）
+
+`build/_r66/build_vulkan.bat` 是这一轮实际用的脚本，核心就是原来的参数 +
+`-DGGML_VULKAN=ON`、`-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16`、
+`-DSPIRV-Headers_DIR=...`、`-DVulkan_GLSLC_EXECUTABLE=...`，
+外面套一层 `call vcvars64.bat`，并设 `CPLUS_INCLUDE_PATH=D:\spirv_headers\install\include`。
+
+### 8.4 ★★ 为什么**不能**用 `GGML_BACKEND_DL=ON` 来做"优雅回退"
+
+看起来 `GGML_BACKEND_DL=ON` 能让后端变成运行时 dlopen、加载失败也不致命，
+但它在 Android 上**找不到后端**：`ggml_backend_load_best()` 的搜索路径是
+`get_executable_path()`（`/proc/self/exe` → **`/system/bin/app_process64`**）与 cwd，
+而不是 App 的 nativeLibraryDir ⇒ 会一个后端都加载不到。
+本工程继续用 **`GGML_BACKEND_DL=OFF`**，回退靠第九节的设备探测 + 异常兜底。
+
+### 8.5 产出与体积（实测）
+
+| 库 | strip 后 |
+|---|---|
+| libllama.so | 3,744,072 |
+| libggml-cpu.so | 962,832 |
+| libggml-base.so | 811,944 |
+| libggml.so | 58,008 |
+| **libggml-vulkan.so** | **19,973,560（≈19.0 MB）** |
+| libdspllm.so | 56,880 |
+
+★ `libggml-vulkan.so` 之所以这么大是**内嵌了 1119 个 SPIR-V 着色器**（各种量化 × 各种算子），
+strip 只去掉了调试信息（31.9 MB → 20.0 MB）。**APK 因此从 37.5 MB 涨到 56.6 MB。**
+★ 依赖链变成（`verify_local_llm_speed.py` 会逐条查）：
+```
+libdspllm.so → libllama.so, libggml.so, libggml-base.so
+libllama.so  → libggml.so, libggml-cpu.so, libggml-vulkan.so, libggml-base.so
+libggml.so   → libggml-cpu.so, libggml-vulkan.so, libggml-base.so
+libggml-vulkan.so → libggml-base.so, **libvulkan.so（系统提供，不打进包）**
+```
+
+九、★★★ 轮次66 真机上走的三个坑（**每一个都能让提速静默归零，全都不报错**）
+--------------------------------------------------------------------------------
+
+设备：小米 2210132C（Xiaomi 13 / **骁龙 8 Gen 2 / Adreno 740** / 安卓 SDK 37）。
+模型：**Qwen2.5-1.5B-Instruct Q4_K_M（1.06 GB，28 层）**。
+
+**坑 ①：`n_gpu_layers` 写死 0。**
+原来的 JNI 里是 `mp.n_gpu_layers = 0;` —— 就算把 Vulkan 编出来，
+层也永远留在 CPU 上（GPU 编了白编）。现在由 Java 侧按「⚡ GPU 加速」开关传进来。
+
+**坑 ②：只认 `GGML_BACKEND_DEVICE_TYPE_GPU`，而手机 GPU 全是 `IGPU`。**
+第一版 `device_is_gpu()` 写的是 `type == GGML_BACKEND_DEVICE_TYPE_GPU`，
+真机上打出：
+```
+★★ 后端设备：Vulkan0(Adreno (TM) 740, 显存 11446/11446 MB); CPU(CPU, ...)
+  ⇒ **一个 GPU 设备都没有，自动回退 CPU**
+```
+设备明明在清单里，却被数成 0 个。`ggml-backend.h` 的枚举是
+**CPU=0 / GPU=1（独立显存）/ IGPU=2（集显）**，手机 GPU 全走 IGPU
+⇒ 现在判据是 `GPU || IGPU`。
+
+**坑 ③（最隐蔽，而且害的是 CPU 那条路）：装上 Vulkan 后端之后，llama.cpp 会把整个模型的 mmap 关掉。**
+`src/llama-model.cpp:1576`：
+```cpp
+if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
+    for (dev : devices) if (!props.caps.mmap_support) { ml.use_mmap = false; break; }
+}
+```
+而 `ggml/src/ggml-vulkan/ggml-vulkan.cpp:15425` 上报的是
+`/* .mmap_support = */ !ctx->is_integrated_gpu` —— **手机集显 = false**。
+⇒ 只要 Vulkan 设备进了 `devices`（哪怕 `n_gpu_layers = 0`），
+**1 GB 权重就被 read() 进匿名内存**（日志里那行 `load_mode = none` 就是它），
+在 Android 上直接被压进 zram 反复换进换出。
+⇒ 修法：显式写 **`mp.load_mode = LLAMA_LOAD_MODE_MMAP;`**（不是 AUTO，AUTO 才会走那段降级）。
+★ 实测代价量级：换页/带宽瓶颈下 decode ~7 s/token。
+
+**★ 坑 ④（本轮的诚实结论）：Adreno 740 驱动拒绝这批着色器。**
+补上 ② 之后 Vulkan 真的用上了（`load_tensors: offloaded 29/29 layers to GPU`，
+`sched_reserve: graph: nodes = 961, splits = 3`），
+但**第一次 `llama_decode` 就抛**：
+```
+Abort message: 'terminating due to uncaught exception of type vk::UnknownError:
+                 vk::Device::createComputePipeline: ErrorUnknown'
+```
+`ggml-vulkan.cpp:772` 的 `createComputePipeline` **外面没有 try/catch**
+（同文件的 `createShaderModule` 有），异常穿过 `llama_decode` → `std::terminate` → **App SIGABRT**。
+★ 生成的 SPIR-V 本身用 `spirv-val` 验过是**合法**的，所以不是"编坏了"，
+更像是 **NDK 自带 glslc（shaderc v2022.3 / 2022 年）太老**、产出的模块
+Adreno 740 的驱动不接受。**这一条本轮没修好**，处理方式是第九节的"自动回落 CPU"。
+
+十、★★ 轮次66 新增的"防闪退 + 自动回落"（**产品要求：默认开 GPU，但不支持时必须静默回落**）
+--------------------------------------------------------------------------------------------
+
+`jni/dspllm_jni.cpp` 里现在有三层：
+
+1. **加载时探设备**：`ggml_backend_dev_count()` 数一遍 GPU（GPU||IGPU）；
+   一个都没有 ⇒ 把层数压回 0，打一行 `★★ 后端设备：… ⇒ 一个 GPU 设备都没有，自动回退 CPU`。
+2. **生成时兜异常**：JNI 入口 `try/catch` 包住整个生成；抓住之后
+   ⇒ 打日志 ⇒ **按纯 CPU 重新加载模型** ⇒ **把这一次生成重跑一遍**。
+   用户只会觉得"慢"，不会看到闪退。
+3. **粘性标记** `g_gpu_runtime_failed`：炸过一次之后，本进程内后续加载一律不再试 GPU
+   （否则每一句都要先炸一遍、白等一次）。
+
+★ 另外把 `llama_log_set()` 接到 `__android_log_print`，ggml 自己的日志（含
+`llama_prepare_model_devices: using device Vulkan0 (Adreno (TM) 740)`、
+`load_tensors: offloaded N/M layers to GPU`）现在**能在 logcat 里看到** ——
+这是"GPU 到底用没用上"在真机上唯一的可观测证据。
+★ 但**必须丢掉 `GGML_LOG_LEVEL_DEBUG`**：实测把 DEBUG 也接进 logcat，
+光 `llama_graph_n_input_tensors` 一次加载就几千行，会把缓冲区冲爆，
+真正要看的那几行反而被冲掉（本轮第一次真机跑就是这么丢掉证据的）。
+
+十一、★★★ 轮次67：Adreno「取着色器被驱动拒绝」——**两边都查清了，一边被推翻**
+--------------------------------------------------------------------------------
+
+### 11.1 ★★★ 「NDK 自带 glslc 太老」这个假设 —— **实测被推翻**（轮次66 的结论是错的）
+
+轮次66 的推断是：`createComputePipeline: ErrorUnknown` 是"NDK 自带 glslc 太老
+（shaderc v2022.3 / ndk-r26c）产出的 SPIR-V 老驱动不接受"，因此想去装新版 Vulkan SDK。
+
+**轮次67 做了对照实验，结论是这条路走不通（不是猜的，是逐字节比的）：**
+
+| | NDK 27.2.12479018 自带 | NDK r29（29.0.14206865）自带 |
+|---|---|---|
+| glslc 版本串 | `shaderc v2022.3 **ndk-r26c**` | `shaderc v2022.3 **ndk-r28b**` |
+| glslc.exe 字节数 | 6,432,864 | 6,332,056 |
+
+用**同一个 llama.cpp 源码、同一个 clang 工具链**，只换 `glslc`，各编一遍
+（`build/_r67/build_vulkan_r67.bat`，产物目录 `build-arm64-vk2`），
+然后把两个构建目录里 **1119 个生成的 SPIR-V** 逐一对比：
+
+```
+旧（ndk-r26c）目录：1119 个文件 / 合共 25,354,464 字节
+新（ndk-r28b）目录：1119 个文件 / 合共 25,354,464 字节
+mul_mat_vec_q4_k_f32_f32.spv                  18844  C02ED4A1… 同
+mul_mat_vec_q4_k_f32_f32_subgroup.spv         18972  4035EE73… 同
+mul_mat_vec_q4_k_f32_f32_subgroup_no_shmem.spv 17320 0BF25E2C… 同
+mul_mat_vec_q6_k_f32_f32.spv                  26784  25581854… 同
+mul_mat_vec_q8_0_f32_f32.spv                  22828  870937C7… 同
+```
+
+⇒ ★★★ **两个 glslc 产出的 SPIR-V 逐字节相同**。所以"换个新一点的 NDK glslc"
+**不可能**改变任何着色器、也就不可能修好这个驱动拒绝。
+⇒ 结论：**"去装 Vulkan SDK 拿新 glslc"这条路线被证伪**，别再花时间。
+（顺带实测：`sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe` 在本机
+**挂了约 2 小时只落盘 2,953,216 字节**（约 2.9 MB；安装器本体是几百 MB 量级），
+最后是**手动掐掉**的 —— 按"实际跑出来的结果"记：**这条路在本机不可行**，
+与轮次66 简报里"200 可访问"不一致。★ 就算下下来了也没用，理由见上表。）
+
+★★ 另外一个**对得上号的巧合**（值得记住）：上面那两个数字
+**17320 / 18844 正好等于**上游 issue #28635 里"失败的"和"能用的"那两个 blob 的大小 ——
+也就是我们源码里 `mul_mat_vec_q4_k_f32_f32_subgroup_no_shmem`（17320）与
+`mul_mat_vec_q4_k_f32_f32`（18844）。**同一个坑，别人也踩到了。**
+
+### 11.2 ★★★ 第三条本地补丁：Adreno matvec 兼容回退（**这条才是真修法**）
+
+上游依据（两条都查到原文了，不是我们猜的）：
+* **llama.cpp issue #28635**：同一份 GLSL、不同 shaderc/NDK 产出的 SPIR-V，
+  在 Adreno 830 上 `vkCreateComputePipelines` 返回 `VK_ERROR_UNKNOWN`。
+* **llama.cpp PR #29165（Adreno 750）**：subgroup 归约的 dequant `mul_mat_vec` 管线
+  会把 Qualcomm 驱动的着色器编译器搞崩；PR 描述里**逐字**写着
+  **「q4_K at 1 column fails pipeline creation with `VK_ERROR_UNKNOWN`」**
+  —— 而**单 token decode 就是 1 列**。
+* 上游的修法：在 `ggml_vk_load_shaders` 里把 `use_subgroups` 置 false，
+  让 `mul_mat_vec` 退回**代码里本来就有**的 shared-memory 归约
+  （与 Imagination 专有驱动那条回退完全同一条路）。
+
+**本工程的改法（与上游不同的地方，故意不同）：**
+上游 PR 把设备名单**写死**成 `vendorID==0x5143 && driver_id==8 && driverVersion==2150604839
+&& deviceName=="Adreno (TM) 750"`，还默认 OFF。本工程要通吃所有手机 GPU，
+写死型号等于换台机器就失效 ⇒ 改成 **只按厂商判**：
+`device->properties.vendorID == 0x5143u`（Qualcomm）就关掉 subgroup 归约。
+
+位置：`ggml/src/ggml-vulkan/ggml-vulkan.cpp` 的 `ggml_vk_load_shaders()` 开头，
+原 `const bool use_subgroups = device->subgroup_arithmetic;` 改成 `bool` 并加：
+```cpp
+#if defined(__ANDROID__)
+    if (use_subgroups && device->properties.vendorID == 0x5143u) {
+        const char * dsp_env = getenv("GGML_VK_ADRENO_SUBGROUP");
+        const bool dsp_force = (dsp_env != nullptr && dsp_env[0] == '1');
+        GGML_LOG_INFO("ggml_vulkan: Adreno 检测到（vendor=0x%04x driver_id=%u driver_version=%u subgroup=%u）"
+                      " ⇒ mul_mat_vec %s\n", ...);
+        if (!dsp_force) use_subgroups = false;
+    }
+#endif
+```
+★ **留了 A/B 开关**（`GGML_VK_ADRENO_SUBGROUP=1` 强制保留 subgroup 归约）：
+改完必须还能在**同一台机器上**做对照，否则"修好了"没法证明。
+★ JNI 侧把**系统属性**桥接成这个环境变量（`jni/dspllm_jni.cpp`）：
+```
+adb shell setprop debug.dsp.adreno_subgroup 1   # 强制 subgroup 归约（= 旧行为，对照组）
+adb shell setprop debug.dsp.adreno_subgroup 0   # 走回退（= 轮次67 默认）
+```
+★ 已知边界：ggml 只在**设备初始化**时读一次这个环境变量，而 Vulkan 设备在进程内是复用的
+⇒ 改属性之后要让 App **重新起一个进程**（`am force-stop` 再打开，不丢数据）才保证生效。
+
+### 11.3 ★★ 第四条改动：把"到底是哪个着色器被拒绝"从 stderr 里救出来（纯诊断）
+
+`ggml-vulkan.cpp` 里 `createComputePipeline` 外面**本来就有**一层 try/catch
+（轮次66 记成"没有"是错的，本提交 `b76b13379` 里已经有了），
+但它把名字打到了 **`std::cerr`** —— 而 **Android 上 App 的 stdout/stderr 是 /dev/null**
+⇒ 上一轮真机上只拿到异常 `what()`（`vk::Device::createComputePipeline: ErrorUnknown`），
+**着色器名字被吞掉了**。改成 `GGML_LOG_ERROR(...)`（JNI 已经把 ggml 日志接进 logcat）：
+```cpp
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_ERROR("ggml_vulkan: compute pipeline creation failed for %s: %s\n",
+                       pipeline->name.c_str(), e.what());
+        throw;
+    }
+```
+★ 这条**不改任何行为**，只是让下一轮真机能看见是 17320 那个变体还是 18844 那个。
+
+### 11.4 轮次67 用到的构建脚本（都在 `build/_r67/`）
+
+| 脚本 | 干什么 |
+|---|---|
+| `build_vulkan_r67.bat` | 用 **NDK r29 的 glslc** 重编 Vulkan 库到 `build-arm64-vk2`（对照实验 + 本次的正式库） |
+| `build_jni_r67.bat` | 用 `build-arm64-vk2` 编 `libdspllm.so`（**必须**对上这一份，否则 ggml 的补丁不在包里） |
+| `build_bench.bat` | **纯 CPU**、`LLAMA_BUILD_TOOLS=ON`，编出 arm64 的 `llama-bench`（见 11.5） |
+| `build_bench_vk.bat` | 同上但 **`GGML_VULKAN=ON`**（复用 `build-arm64-vk2`），得到能验 Adreno 回退的 `llama-bench` |
+| `bench.py` | 推送 + 扫描（`push` / `cpu` / `gpu` / `app` 四个子命令），**下一轮真机直接用** |
+
+★★ **glslc 的实际路径（本轮用的）**：`D:/llamacpp_src/_r67_dl/ndk_r29/android-ndk-r29/shader-tools/windows-x86_64/glslc.exe`
+（NDK r29 的 zip 与解压目录**刻意放在工程树外** —— 795 MB 安装包 + 几 GB 解压物
+**绝不能进源码交付包**；`D:\petbuild\build\_r67\` 只留脚本与日志，实测 15 MB。）
+★ 同理 **0.5B 对照模型**也在那边：`D:\llamacpp_src\_r67_dl\qwen0.5b-q4km.gguf`（491,400,032 字节，
+来自 `hf-mirror.com/Qwen/Qwen2.5-0.5B-Instruct-GGUF`；huggingface.co 直连在本机**不通**）。
+
+### 11.5 ★★ llama-bench（真机对照工具）：编法、依赖、怎么推
+
+**为什么要有它**：它绕开 App 的全部封装（JNI / 路由 / 提示词 / 流式回调），
+能干净地回答"**是引擎慢，还是这台机器的环境慢**"，还能一次扫
+`-t`（线程）/ `-ngl`（卸载层）/ `--mlap`… 以及 **mmap vs `--no-mmap` vs `--mlock`**。
+这正是"权重到底有没有常驻内存"的判据。
+
+编法：`-DGGML_VULKAN=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_COMMON=ON`，其余同第三节。
+产物在 `<BLD>/bin/`：`llama-bench`（ELF 可执行，7 KB）、`libllama-bench-impl.so`、
+`libllama-common.so`（**未 strip 时 84 MB**）以及 libllama / libggml* / libc++_shared.so。
+
+推送（手机**未 root、包也不 debuggable**，只能放 `/data/local/tmp`）：
+```
+adb push <每个文件> /data/local/tmp/lb/
+adb shell "cd /data/local/tmp/lb && chmod 755 llama-bench && ./llama-bench -m <模型> -t 4,6,8"
+```
+★ strip 之后整包 **11.6 MB**（`llvm-strip --strip-unneeded`，只 strip `.so`）。
+★ 运行时要能 `dlopen` 到同目录的 `.so` ⇒ **必须在那个目录里跑**（`cd` 过去），
+或者设 `LD_LIBRARY_PATH=/data/local/tmp/lb`。
+★ 若它报 `VK_ERROR_UNKNOWN` 而 App 里能跑，别忘了 issue #28635 里那条设备怪癖：
+**某些 Adreno 驱动的专有 loader 只在"真正的 App 进程"里完成 GPU 工作**，
+`adb shell` 直接起的进程对**每个** pipeline 都返回 `VK_ERROR_UNKNOWN`
+（那种情况下 llama-bench 只能用来量 CPU）。
+
+### 11.6 本轮库体积（实测，易变，别当判据）
+| 库 | strip 后 |
+|---|---|
+| libllama.so | 3,744,072 |
+| libggml-cpu.so | 962,832 |
+| libggml-base.so | 811,944 |
+| libggml.so | 58,008 |
+| libggml-vulkan.so | 19,973,416 |
+| libdspllm.so | 66,920 |
+
+★ `libggml-vulkan.so` 比轮次66 小 144 字节 —— 因为两版 glslc 的 SPIR-V 逐字节相同，
+差的只是 `.comment` 段里的编译器版本串。**这本身就是 11.1 那个结论的旁证。**
+
+
+十二、★★★ 轮次68：三态 GPU（off / auto / force）+ 强制失败不回落（**照这一节做**）
+----------------------------------------------------------------
+
+### 12.1 这一轮改了什么（**只有 JNI**，llama.cpp 一行没动）
+
+* `jni/dspllm_jni.cpp`：
+  * 新增 `#define DSP_GPU_MODE_OFF/AUTO/FORCE`（0/1/2，与 Java 的 `GpuMode.CODE_*` 一一对应）；
+  * `do_load_locked()` 多一个 `jgpu_mode` 参数，并按方式分流：
+    `force` 探不到 GPU ⇒ **返回错误**（不压回 0 层）；`auto` 探不到 ⇒ 压回 0 层并打日志；
+  * 新增 `force_gpu_failed_locked()` —— **强制失败的唯一出口**：
+    它的函数体里**没有** `do_load_locked`（只清现场、不重载），
+    并把「中文结论 + 原始错误串」写进 `last_err`；
+  * 新增 `auto_fallback_cpu_retry()` —— 轮次66 那段"按纯 CPU 重载 + 重跑"整段挪进这里，
+    **只有 auto 会调用它**；`nativeGenerate` 的函数体里**根本不出现** `do_load_locked`
+    ⇒ "force 悄悄回落 CPU"这条路径在代码里不存在（结构性的，断言钉在形状上）；
+  * `nativeLoad()` 多一个 `jgpu_mode` 参数；用户**改方式**就清掉"以前炸过"的粘性标记；
+  * 新增 `/ GPU 方式=%s` 到加载日志（真机上"我到底选的是哪种"的唯一现场证据）。
+* Java 侧（`GpuMode` / `GpuFailNotice` / `GpuModeUi` / `Prefs` / `LocalChat` / `LocalLlm` /
+  `MainActivity` / `FloatingService` / `ChatActivity`）—— 三态、默认 force、一键退路、一页纸自测指南。
+
+### 12.2 ★★ 三条本地补丁**逐条核实过**（本轮没改 llama.cpp，所以不需要重打）
+
+```
+# ① posix_memalign（buffers.cpp）
+> ggml\src\ggml-vulkan\ggml-vulkan-buffers.cpp:24
+  if (posix_memalign(&p, align, size) != 0) return nullptr;
+
+# ② vkGetPhysicalDeviceFeatures2 走 dispatcher（三个调用点）
+> ggml\src\ggml-vulkan\ggml-vulkan.cpp:4520 / 5169 / 16412
+  if (dsp.vkGetPhysicalDeviceFeatures2 != nullptr) { ... }
+
+# ③ Adreno matvec 回退（第三条，轮次67）
+> ggml\src\ggml-vulkan\ggml-vulkan.cpp:2899 / 2919
+  bool use_subgroups = device->subgroup_arithmetic;
+  if (use_subgroups && device->properties.vendorID == 0x5143u) { ... }
+  if (!dsp_force) use_subgroups = false;
+```
+★ 重编 JNI **之前**先跑一遍上面三条（或直接跑 `python build\verify_local_llm_speed.py`，
+第六/八节那几条判据就是查它们的）。
+
+### 12.3 本轮的构建（实测）
+
+```
+build/_r68/build_jni_r68.bat     # 只重编 libdspllm.so（复用 build-jni-vk2，增量）
+<NDK>/.../llvm-strip.exe --strip-unneeded <build-jni-vk2>/libdspllm.so
+copy <build-jni-vk2>/libdspllm.so D:\petbuild\lib\arm64-v8a\
+```
+| 库 | strip 后 |
+|---|---|
+| libdspllm.so | **71,320**（轮次67 是 66,920；多出来的是三态/分流/文案那几个字符串与分支） |
+| 其余 5 个库 | 与轮次67 **逐字节相同** |
+
+★ 编译**零警告**（轮次67 补上 `nativeLoaded` 的 `return` 之后一直保持零警告；
+这一轮新增的代码也必须有 `return` —— 见 12.4）。
+★ `c++filt` 不需要：`libdspllm.so` 仍然只导出 6+6 个 `Java_*` 符号
+（JNI 符号名**不含签名**，所以多一个参数不会多出符号；`verify_local_llm.py` 会数）。
+
+### 12.4 ★★ 本轮踩到的两个坑（都值得记）
+
+**坑 ①（纪律级）：绝不在**编译**的同时跑反向套件。**
+反向套件的破坏项会**临时改写** `jni/dspllm_jni.cpp` 等源文件，
+而 ninja 那一刻正好在读这些文件 ⇒ `os.replace()` 还原时抛
+`PermissionError: [WinError 5] 拒绝访问`，脚本**当场中断**，
+留下一个 `.r66bak` 与被改坏的源文件（本轮实测发生）。处理：
+`recover()`（脚本开头的那个函数）会把 `.r66bak` 还原；
+本轮实测还原后源文件与原文一致（74,786 字节），并把 `dspllm_jni.cpp.o` **删掉重编**，
+再用字符串检查确认 `.so` 里是**新**文案而不是被破坏的中间态。
+⇒ **规矩：重编与反向套件分两个时间窗跑。**
+
+**坑 ②：`ninja` 只看时间戳，"源文件被改回来"它会当成"没变"。**
+上面那次事故之后，`.o` 比 `.cpp` **新**（虽然它是从被改坏的中间态编出来的）
+⇒ `cmake --build` 只做了一次 Linking（`[1/1]`），**没有重编**。
+识别方法：正常重编的第一行一定是 `[1/2] Building CXX object ... dspllm_jni.cpp.o`；
+只看到 `[1/1] Linking` 就说明它**没**重编 ⇒ 手动删 `.o` 再来一遍。
+
+### 12.5 这一轮的诚实边界
+
+* ★★★ **没有真机读数**：开发机 `adb devices` **全程为空** ⇒
+  "强制 GPU 在 Adreno 740 上到底能不能跑起来"**没有验过**，
+  连轮次67 那条 Adreno 补丁是否真的治好也**仍然没有确认**；
+* ★★★ **"强制 GPU"不解决当前最大的瓶颈**：真机读数显示 decode ≈6.5 秒/字、
+  有效权重带宽只有 ~163 MB/s（1.06 GB ÷ 6.5 s），而 **GPU 与 CPU 取的是同一块内存**
+  ⇒ "每吐一个字都要把 1 GB 权重重新捞一遍"这件事**换成 GPU 也救不了**；
+  可执行建议：换 **0.5B（≈400 MB）**、关掉后台应用；
+* ★ 验证方式交给用户自测：交付目录里的 **`本地模型-自测指南.md`**（一页纸），
+  它引用的每一条设置项/按钮/日志原文都由 `verify_local_llm_speed.py` 第十四节
+  与源码**逐条钉住**（改一边就红）。
+
+
+十三、★★★ 轮次69：两态（开 / 关）+ **删掉那个把"换模型"堵死的粘性标记**（**照这一节做**）
+----------------------------------------------------------------
+
+### 13.1 这一轮改了什么（**只有 JNI**，llama.cpp 一行没动）
+
+用户原话：「**增加模型卸载功能，现在安装了之后模型无法更换其他的gguf模型，
+然后吧加速做成开GPU**」。⇒ 本轮 = **修 bug + 简化设置**。
+
+* `jni/dspllm_jni.cpp`：
+  * 宏改成**两个**：`#define DSP_GPU_MODE_OFF 0` / `#define DSP_GPU_MODE_ON 1`
+    （轮次68 的 `_AUTO(1)` / `_FORCE(2)` **删掉**；Java 侧不再可能传 2，
+    传进来也会被 `normalize_gpu_mode` 当成认不出 ⇒ off，落在安全的一侧）；
+  * `do_load_locked()` 里**两态分流**：`on` 探不到 GPU ⇒ `set_err("开 GPU 失败…")` + `return false`
+    （**不压回 0 层**）；`off` 才 `want_gpu = 0`（并且显式只把 CPU 设备交给 llama.cpp）；
+  * ★★★ **删掉进程级粘性标记 `g_gpu_runtime_failed`**（轮次66 引入、轮次68 只让它对 auto 生效）：
+    它就是用户报的"换不了模型"的根因 —— 默认 force 之下，一次 GPU 失败之后
+    `do_load_locked` 里那条 `if (g_gpu_runtime_failed) { set_err(...); return false; }`
+    会让**之后每一次加载**（换模型、重新导入都算）直接失败，只有"用户手动改一次 GPU 方式"才能清掉。
+    ⇒ 现在**每次加载都是一次全新的尝试**。该标识符在本文件的**真代码里出现 0 次**（断言钉着；
+    注释里还留着它的名字讲这段历史，`cpp_code`（去注释视图）里查的是"0 次"）；
+  * **整条 auto 回落路径删掉**：`auto_fallback_cpu_retry()` 连同它要用的两个全局
+    `g_model_path` / `g_load_batch` 一起删除 ⇒ 本文件里**根本不存在**"按纯 CPU 重载并重跑"
+    这个动作（连它的参数都没有）。两态之下没有哪一档允许静默回落；
+  * `force_gpu_failed_locked/safe` → 改名 **`gpu_required_failed_locked/safe`**
+    （唯一出口，函数体里没有 `do_load_locked`；"不回落"这条性质仍靠这个形状成立）；
+  * `nativeLoad` 的两条 catch 也走同一个出口 ⇒ 加载阶段同样不存在"悄悄按纯 CPU 重来一遍"；
+  * 加载日志 `/ GPU 方式=%s` → **`/ GPU 档位=%s`**（值现在是 `on（开：真的用 GPU，失败不回落 CPU）`
+    / `off（关：纯 CPU）`）。
+* Java 侧（`GpuMode` 两态 / `GpuFailNotice` 改口径 / `GpuModeUi` 只剩一颗退路按钮 /
+  **新增纯类 `LocalModelMenu`** / `LocalChat.unloadNow()` / `Prefs` / `LocalLlm` /
+  `MainActivity`（新增「⏏ 卸载当前模型」）/ `FloatingService` / `ChatActivity`）。
+* ★ 兼容：**pref 键名故意不换**（`local_llm_gpu_mode`），靠 `GpuMode.normalize` 认旧值 ——
+  `force` / `auto` 都读成「开」，`off` 读成「关」；更老的 boolean：明确关过 ⇒ 关，开过/没碰过 ⇒ 开（默认）。
+  JNI 的 `nativeLoad` 仍是**六个参数**（签名没变 ⇒ JNI 符号名没变）。
+
+### 13.2 ★★ 三条本地补丁**逐条核实过**（本轮没改 llama.cpp，所以不需要重打）
+
+```
+# ① posix_memalign（buffers.cpp）
+> ggml\src\ggml-vulkan\ggml-vulkan-buffers.cpp:24
+  if (posix_memalign(&p, align, size) != 0) return nullptr;
+
+# ② vkGetPhysicalDeviceFeatures2 走 dispatcher（三个调用点）
+> ggml\src\ggml-vulkan\ggml-vulkan.cpp:4520 / 5169 / 16412
+  if (dsp.vkGetPhysicalDeviceFeatures2 != nullptr) { ... }
+
+# ③ Adreno matvec 回退（第三条，轮次67）
+> ggml\src\ggml-vulkan\ggml-vulkan.cpp:2919 / 2928
+  if (use_subgroups && device->properties.vendorID == 0x5143u) { ... }
+  if (!dsp_force) use_subgroups = false;
+```
+
+### 13.3 本轮的构建（实测）
+
+```
+build/_r69/build_jni_r69.bat     # 只重编 libdspllm.so（复用 build-jni-vk2，增量）
+<NDK>/.../llvm-strip.exe --strip-unneeded <build-jni-vk2>/libdspllm.so
+copy <build-jni-vk2>/libdspllm.so D:\petbuild\lib\arm64-v8a\
+```
+| 库 | strip 后 |
+|---|---|
+| libdspllm.so | **66,912**（轮次68 是 71,320；**变小**是因为删掉了 auto 回落整条路径与粘性标记） |
+| 其余 6 个库 | 与轮次68 **逐字节相同** |
+
+★ 编译**零警告**（0 条 warning/error）。
+★ 重编的第一行必须是 `[1/2] Building CXX object ... dspllm_jni.cpp.o`
+（只看到 `[1/1] Linking` 就说明 ninja 认为"没变" ⇒ 手动删 `.o` 再来）。
+★ `.so` 里的字符串核实过：`开 GPU 失败（已按你的设置不回落 CPU）` / `GPU 档位=%s` /
+`开 GPU：认出` / `GPU 加速＝关（纯 CPU）` 都在，而 `auto_fallback_cpu_retry` /
+`g_gpu_runtime_failed` / `强制 GPU 失败` **都不在**。
+
+### 13.4 ★★ 两个坑（沿用轮次68 的教训，本轮同样必须先看这两条）
+
+**坑 ①（纪律级）：绝不在**编译**的同时跑反向套件。**
+反向套件的破坏项会**临时改写** `jni/dspllm_jni.cpp` 等源文件，而 ninja 那一刻正好在读它
+⇒ `os.replace()` 还原时抛 `PermissionError: [WinError 5]`，脚本当场中断，
+留下 `.r66bak` 与被改坏的源文件。⇒ **重编与反向套件分两个时间窗跑。**
+
+**坑 ②：`ninja` 只看时间戳。** 源文件"被改坏又改回来"之后，`.o` 比 `.cpp` 新
+⇒ `cmake --build` 只做 `[1/1] Linking`（**没重编**）。识别方法见 13.3。
+
+### 13.5 这一轮的诚实边界
+
+* ★★★ **没有真机读数**：开发机 `adb devices` **全程为空** ⇒
+  "开 GPU 在 Adreno 740 上到底能不能跑起来"**没有验过**；
+* ★★★ **用户这次报的「模型无法更换其他的 gguf 模型」本身就是真机证据** ——
+  诊断是围着它做的，根因（那个粘性标记）有代码依据、也确实在默认 force 之下**必然**被触发；
+  但"用户手机上现在真的能换了"这句话**本轮没说**（要等他插上手机自测）；
+* ★★★ **"开 GPU"不解决当前最大的瓶颈**：decode ≈6.5 秒/字、有效权重带宽只有 ~163 MB/s，
+  而 **GPU 与 CPU 取的是同一块内存** ⇒ 建议换 **0.5B**（≈400 MB）、关后台应用；
+* ★ 联发科（Mali）依然**一台都没验过**。
+
+
+十四、★★★ 轮次71：调优旋钮（8 个）+ 「本地推理自检」（**照这一节做**）
+----------------------------------------------------------------
+
+### 14.1 这一轮改了什么（**只有 JNI 与 Java，llama.cpp 一行没动**）
+
+用户原话：**「继续做gpu加速，漫游已经修好了」**。这一轮的目标不是"再猜一个参数"，
+而是**让用户不连电脑也能自己 A/B 出答案** —— 因为开发机 `adb devices` 从头到尾是空的，
+而真机是**用户自己的日常机**（他不会连电脑、更不会挂 logcat）。
+
+* `src/com/deepseek/.../LocalTune.java`（**新增，纯类**）：
+  8 个调优旋钮的**唯一定义处** —— 键名 / 取值域 / 默认值 / 文案 / 依据等级。
+  上线串是一个自描述的字符串（`k=v;k=v;…`，顺序固定），`normalize()` 是唯一入口：
+  **认不出的键丢掉、认不出的值换默认、缺的补默认** ⇒ 磁盘上永远只有规范串。
+  ★★ 8 个旋钮与依据（`basis()` 里逐条写着，界面上也显示）：
+  | 键 | 旋钮 | 取值 | 默认 | 依据 |
+  |---|---|---|---|---|
+  | `adreno` | Adreno 的归约方式 | auto / subgroup | auto | **有上游依据**（issue #28635 / PR #29165；轮次67 的本地补丁）——本轮把它做成了 UI |
+  | `flash` | flash attention | auto / on / off | auto | **有上游依据**（`llama_context_params.flash_attn_type`） |
+  | `ubatch` | n_ubatch | 128/256/512/1024 | 512 | **有上游依据**（`llama_context_params.n_ubatch`） |
+  | `mlock` | 权重锁进内存 | on / off | on | **有上游依据**（`mlock(2)` + `RLIMIT_MEMLOCK`；默认仍是"尝试"） |
+  | `loadmode` | 权重载入方式 | mmap / none / mlock | mmap | **有上游依据**（`llama_load_mode`） |
+  | `mmvq` | Vulkan 量化 mat-vec | auto / off / force | auto | **有上游开关**（`GGML_VK_DISABLE_MMVQ` / `GGML_VK_FORCE_MMVQ`）；★ **它能不能绕开 Adreno 上那个失败的 q4_K 着色器是"我们的推测"，没在真机上验过** |
+  | `fusion` | Vulkan 算子融合 | on / off | on | **有上游开关**（`GGML_VK_DISABLE_FUSION`）；对 Adreno 有没有用是**我们的推测**，没验过 |
+  | `async` | Vulkan 异步提交 | on / off | on | **有上游开关**（`GGML_VK_DISABLE_ASYNC`）；对 Adreno 有没有用是**我们的推测**，没验过 |
+  ★★★ **默认档与轮次70 的行为逐字等价**（`ubatch=512` ⇔ 老写法 `(batch<512?batch:512)`；
+  `loadmode=mmap` ⇔ 老写法 `LLAMA_LOAD_MODE_MMAP`；`flash=auto` ⇔ llama.cpp 的默认）
+  ⇒ **用户什么都不动 = 零影响**，这是这一整套旋钮敢默认开着的前提（有断言钉着）。
+* `src/com/deepseek/.../LocalSelfTest.java`（**新增，纯类**）：
+  自检报告的**抬头 / 结论 / 下一步 / 组装**。它只解析原生侧那几行机器可读的 `数值.*`，
+  不去正则匹配中文；四档结论（没跑起来 / 没有 Vulkan 设备 / 驱动拒绝计算管线 / 慢得离谱）
+  与"下一步该点哪里"都写在这里。温度用 **0（贪心）**：两次自检之间必须可比。
+* `src/com/deepseek/.../Prefs.java`：新增 `KEY_LOCAL_TUNE = "local_llm_tune"`
+  （一个键存一条规范串）+ `localTune` / `setLocalTune` / `setLocalTuneKnob` / `localTuneLabel`。
+* `src/com/deepseek/.../LocalChat.java`：`ensureLoaded` 把 `Prefs.localTune(ctx)` 传下去；
+  新增 `selfTest(Context)` —— **先放掉内存里的模型**（否则用的不是"当前设置"，结果就是假的）
+  → 按当前设置载入 → 跑固定短提示 → 组装报告。
+* `src/com/deepseek/.../LocalLlm.java`：`nativeLoad` 多第 7 个参数 `tune`；
+  新增 `nativeLastStats()`（第 7 个 native）；新增 `lastStats()`（拿不到读数时返回**人话**，
+  不是 null —— null 在界面上就是"点了没反应"）。
+* `src/com/deepseek/.../MainActivity.java`：面板里新增
+  「🧪 本地推理自检（跑一句，出一屏结果）」（后台线程 + 进度 + 可取消 + 一键复制）
+  与「🎛 本地推理调优（进阶 · A/B 用）」（8 行由 `LocalTune.KEYS` 循环生成 + 一键回默认）。
+* `jni/dspllm_jni.cpp`：
+  * `parse_tune()` —— 白名单解析器（**认不出就什么都不做**），键名/取值与 `LocalTune.java`
+    **两边逐字对应**（断言第十八节把每一个键、每一个取值对起来查）；
+  * 后端级旋钮 → `setenv`/`unsetenv`（`GGML_VK_ADRENO_SUBGROUP` / `GGML_VK_DISABLE_MMVQ` /
+    `GGML_VK_FORCE_MMVQ` / `GGML_VK_DISABLE_FUSION` / `GGML_VK_DISABLE_ASYNC`）；
+    ★ 默认档位**一定要 unsetenv** —— 只 setenv 不清会让"改了没效果"（反向项 CC 盯着它）；
+  * 载入级旋钮 → `cp.flash_attn_type` / `cp.n_ubatch`（夹到 `≤ n_batch`）/ `mp.load_mode` /
+    `try_pin_model_file(path, tune.mlock)`；
+  * 新增 `LastRun g_last` + `build_last_report()`（`nativeLastStats` 的全部内容）+
+    8 行 **带锁的**后端警告尾巴（`g_log_tail` / `g_log_tail_lock`）；
+  * `nativeLoad` 加 `jstring jtune`（**两套包名**都要改）、新增 `nativeLastStats`
+    （**两套包名都要转发**：只改开发版那套 ⇒ 正式版静默失效）。
+
+### 14.2 ★★ 三条本地补丁**逐条核实过**（本轮没改 llama.cpp，所以不需要重打）
+
+```
+# ① posix_memalign（buffers.cpp）
+> ggml\src\ggml-vulkan\ggml-vulkan-buffers.cpp:24
+  if (posix_memalign(&p, align, size) != 0) return nullptr;
+
+# ② vkGetPhysicalDeviceFeatures2 走 dispatcher（三个调用点）
+> ggml\src\ggml-vulkan\ggml-vulkan.cpp:4520 / 5169 / 16412
+  if (dsp.vkGetPhysicalDeviceFeatures2 != nullptr) { ... }
+
+# ③ Adreno matvec 回退（第三条，轮次67）
+> ggml\src\ggml-vulkan\ggml-vulkan.cpp:2919 / 2928
+  if (use_subgroups && device->properties.vendorID == 0x5143u) { ... }
+  if (!dsp_force) use_subgroups = false;
+```
+★ 轮次71 起，③ 的 A/B **多了一条手机上的路**：设置页「🎛 本地推理调优 → Adreno 的归约方式」。
+两条路的优先级写在 `do_load_locked` 里：**旋钮非默认时以旋钮为准**，
+旋钮是默认（auto）时才看 `debug.dsp.adreno_subgroup` 这个系统属性
+（PC 上批量对照的老通路**保留**）。
+
+### 14.3 本轮的构建（实测）
+
+```
+build/_r71/build_jni_r71.bat     # 只重编 libdspllm.so（复用 build-jni-vk2，增量）
+<NDK>/.../llvm-strip.exe --strip-unneeded <build-jni-vk2>/libdspllm.so
+copy <build-jni-vk2>/libdspllm.so D:\petbuild\lib\arm64-v8a\
+```
+| 库 | strip 后 |
+|---|---|
+| libdspllm.so | **88,344**（轮次69 是 66,912；多出来的是 8 个旋钮的解析/映射、自检报告与后端错误尾巴） |
+| 其余 6 个库 | 与轮次69 **逐字节相同** |
+
+★ 编译**零警告**（`_r71/jni_build.log` 只有 `[1/2] Building CXX object …` 与 `[2/2] Linking` 两行）。
+★ 重编第一行必须是 `[1/2] Building CXX object ... dspllm_jni.cpp.o`
+（只看到 `[1/1] Linking` 就说明 ninja 认为"没变" ⇒ 手动删 `.o` 再来）。
+★ `.so` 里的字符串核实过：`本次调优（与本轮默认不同的项）` / `生效参数：flash attention=` /
+`数值.decode_ms_per_token=` / `最近的后端警告/错误=` / `调优：Adreno 归约＝自动` /
+`调优：Vulkan MMVQ＝关` / `载入方式＝**不用 mmap**` / `结果=还没跑过` 都在，
+而 `g_gpu_runtime_failed` **仍然不在**（轮次69 那条纪律照旧成立）。
+★ APK **dev 56.7 MB / rel 56.9 MB**；dex **dev `05fb6924…` / rel `9db02e5f…`**。
+
+### 14.4 ★★ 两个坑（沿用轮次68/69 的教训，本轮同样必须先看这两条）
+
+**坑 ①（纪律级）：绝不在**编译**的同时跑反向套件。** 见 12.4 —— 本轮又一次验证了这条：
+反向套件跑起来会临时改写 `jni/dspllm_jni.cpp`、`src/**/*.java` 与那份指南。
+
+**坑 ②：`ninja` 只看时间戳。** 见 12.4/13.4。
+
+**★ 坑 ③（本轮新踩，值得记）：反向项的锚点会随产品改口径而"悬空"或变"假绿"。**
+本轮新增 21 条破坏项之后重跑，**5 条当场红**，其中 3 条是**假绿**、2 条是**锚点没找到**：
+  * `I`（后端不再按档位决定层数）/ `BN`（对话后端不传 tune）：那句话在 `LocalChat.java` 里
+    现在出现**两次**（`ensureLoaded` 与 `selfTest`）⇒ 只换第一处，判据还能在第二处找到它
+    ⇒ **假绿**。修法：`all_=True`。
+  * `BM`（JNI 入口摘掉 tune）：开发版/正式版**两套签名**，同理 ⇒ `all_=True`。
+  * `Z` / `AI`：锚点里那几行源码在轮次71 被**改写**过（`try_pin_model_file` 多了实参、
+    catch 里多了一行 `last_fail`）⇒ 锚点没找到。修法：跟着新写法更新锚点。
+  ⇒ **通则：新增代码时，"同一句话出现几次"和"锚点还在不在"都要重新数一遍。**
+
+### 14.5 这一轮的诚实边界（**别把这一轮读成"GPU 已经修好了"**）
+
+* ★★★ **仍然没有真机读数**：开发机 `adb devices` **全程为空** ⇒
+  "这批旋钮里到底哪一个能让 Adreno 740 上的 Vulkan 跑起来"**一个都没验过**；
+  本轮的交付形态是"**把它做成用户自己能在手机上 A/B 的东西**"，
+  而不是"我们替他试出来了"；
+* ★★★ **8 个旋钮的依据等级不一样，不许混着说**：
+  `adreno` / `flash` / `ubatch` / `mlock` / `loadmode` 这 5 个是**上游真的有的参数**
+  （前 4 个还各有上游 issue/PR 或系统调用依据）；`mmvq` / `fusion` / `async` 这 3 个
+  上游**确实有这些开关**（`ggml-vulkan.cpp` 里 `getenv` 得到），
+  但**"它们能治好 Adreno 那个失败的着色器"是我们的推测，没验过**；
+* ★★★ **"开 GPU"仍然不解决当前最大的瓶颈**：decode ≈6.5 秒/字、有效权重带宽只有 ~163 MB/s
+  （1.06 GB ÷ 6.5 s），而 **GPU 与 CPU 取的是同一块内存** ⇒ 换成 GPU 也救不了
+  "每吐一个字都把 1 GB 权重重新捞一遍"。真建议仍是**换 0.5B（≈400 MB）**或关后台应用；
+* ★★ **后端级那 4 个旋钮要"完全退出 App 再打开"才保证生效**：ggml 在**造 Vulkan 设备那一刻**
+  读这些环境变量，而 Vulkan 设备在**一个进程里只造一次**。界面上、日志里、指南里都写明了
+  —— 不写清就会被误读成"这个参数没用"；
+* ★ 联发科（Mali）依然**一台都没验过**；★ 本地推理自检里的"快 / 慢"阈值
+  （3000 / 1000 ms per token）是**阈值常量**，不是实测出来的分界线。
+
+### 14.6 ★★★ 任务里点名的另外两条 GPU 调优：**一条不需要做、一条做不了**（都查过上游，不是偷懒）
+
+* **KV 放 GPU**（`llama_context_params.offload_kqv`）：上游**默认就是 `true`**
+  （`llama-context.cpp` 的 `llama_context_default_params()` 里 `/*.offload_kqv =*/ true`），
+  我们**没有改过它** ⇒ 层放到 GPU 上时 KV 也跟着上去。
+  ★ **故意不做成旋钮**：它没有一个"值得在手机上 A/B"的档位 ——
+  `false` 只会更慢（KV 留在 CPU 上、每步都要来回搬），做成开关就是给用户添一个坑。
+* **Vulkan 着色器 / 管线缓存**：在这个 commit（`b76b13379d3b…`）的 `ggml-vulkan` 里
+  **根本不存在** —— `VkPipelineCache` / `vkCreatePipelineCache` 在
+  `ggml-vulkan.cpp` 与 `ggml-vulkan.hpp` 里**一条都没有**（grep 过）。
+  ⇒ 这一条**做不了**，不是"我们没做"。想做要先升 llama.cpp 版本，
+  而那要**重打三条本地补丁**（见第八、十二节）。
+* ★★ 另外记一条本轮的**耦合**（踩坑级别）：`n_ubatch` 与 `n_batch` 是一对 ——
+  Java 侧 `LocalLlm.DEFAULT_BATCH` 是 **512**，所以"夹到 n_batch"这句话本身会让
+  **用户选 1024 时被静默夹回 512**（界面上点得动、日志里写着 1024 的意图，实际什么都没变）。
+  ⇒ `do_load_locked` 里现在是"用户要的 ubatch 比 n_batch 大（且 ≤ ctx）就**把 n_batch 一起抬上去**"，
+  并且 `cp.n_batch` 必须在**抬过之后**才赋值（顺序反了等于没抬，有断言 + 反向项 CL 钉着）。
+
+
+十六、★★★ 轮次72：真机 GPU 实测（**这台设备第一次连上电脑**）（**照这一节做**）
+----------------------------------------------------------------
+
+★★★ 写在最前面：**这是本工程第一次拿到真机读数**。之前每一轮都写着"开发机 `adb devices`
+全程为空" —— 轮次72 用户把手机连上了，于是"这台机器的 GPU 到底行不行"终于有答案了。
+**答案是不行**，而且**8 个旋钮一个都救不了**；但"慢得离谱"这件事的真相也一并查清了
+（这台机器**纯 CPU 就有 44.75 tok/s**，见 16.3）。
+
+### 16.1 这台机器是什么（**实测**，别信简报里的旧记录）
+
+| 项 | 值 | 怎么读到的 |
+|---|---|---|
+| 设备号 | **`<设备序列号>`** | `adb devices -l` |
+| 型号 | **`25091RP04C`**（product/device = **`piano`**） | `getprop ro.product.model` |
+| SoC | **`SM8750P`**（骁龙 8 Elite），`ro.board.platform=sun` | `getprop ro.soc.model` |
+| 内存 | **11,423,872 kB ≈ 10.9 GiB** | `/proc/meminfo` |
+| **GPU** | **`Adreno (TM) 830`** | `/sys/class/kgsl/kgsl-3d0/gpu_model` = `Adreno830v2`；SurfaceFlinger `Qualcomm, Adreno (TM) 830`，GL 驱动 `V@0800.72`；`ro.gfx.driver.1=com.qualcomm.qti.gpudrivers.sun.api35` |
+| Vulkan 侧的设备串 | `Adreno (TM) 830, 显存 15252 MB`；`vendor=0x5143 driver_id=8 driver_version=2150760520 subgroup=64` | App 日志 `后端设备清单=` 与补丁那一行 |
+| 系统 | Android **16 / SDK 36**，HyperOS `OS3.0.307.0.WPYCNM` | `getprop` |
+| 模型 | `qwen2.5-1.5b-instruct-q4_k_m.gguf`（1,117,320,736 B / 载入报 1059.9 MB） | `adb push` + App 导入 |
+
+★★ 简报里写的"小米 13 / 2210132C / nuwa / **Adreno 740**"**本轮不在线**
+（`adb devices` 只有上面这一台）⇒ 那台机器本轮 **0 条读数**，它的
+`createComputePipeline: ErrorUnknown` 与本节 830 的结论**不能互相代替**。
+
+### 16.2 ★★★ 读数表（同一个模型 / 同一条固定提示 / 贪心 / 全都走「🧪 本地推理自检」）
+
+| # | 档位 / 旋钮 | 结果 | 被拒的管线名 | prefill | decode | `RssFile` | 载入耗时 |
+|---|---|---|---|---|---|---|---|
+| E1 | **GPU 开 + 全默认**（补丁生效） | **失败** | `mul_mat_vec_q4_k_f32_f32` | 8 tok / −1 ms（0.00） | 0 tok | **1214 MB** | 1232 ms |
+| E2 | `debug.dsp.adreno_subgroup=1`（补丁**不生效**的对照组） | **失败** | 同上 | 同上 | 0 tok | 1231 MB | 927 ms |
+| E3 | `mmvq=off` | **失败** | 同上 | 同上 | 0 tok | 1185 MB | 1192 ms |
+| E4 | `mmvq=force` | **失败** | 同上 | 同上 | 0 tok | 1176 MB | 1007 ms |
+| E5 | `mmvq=force` + `fusion=off` | **失败** | 同上 | 同上 | 0 tok | 1244 MB | 734 ms |
+| E6 | `mmvq=force` + `async=off` | **失败** | 同上 | 同上 | 0 tok | 1242 MB | 631 ms |
+| **E7** | **GPU 关（纯 CPU）** | **成功** | — | **8 tok / 73 ms（109.50 tok/s）** | **24 tok / 536 ms（44.75 tok/s，22 ms/token）** | 999 MB | 1380 ms |
+
+* E1~E6 的失败**逐字相同**：
+  `ggml_vulkan: compute pipeline creation failed for mul_mat_vec_q4_k_f32_f32:
+   vk::Device::createComputePipeline: ErrorUnknown`
+* E1/E2 的**补丁那一行不同**（证明两次真的走了两条不同的路）：
+  * E1（默认）：`Adreno 检测到（vendor=0x5143 driver_id=8 driver_version=2150760520 subgroup=64） ⇒ mul_mat_vec 改用 shared-memory 归约（Adreno 兼容回退，防 VK_ERROR_UNKNOWN）`
+  * E2（属性=1）：`…… ⇒ mul_mat_vec **保留** subgroup 归约（环境变量 GGML_VK_ADRENO_SUBGROUP=1 强制）`
+* 六次 GPU 尝试都是 **`load_tensors: offloaded 29/29 layers to GPU`**、
+  `CPU_Mapped 125.19 MiB + Vulkan0 934.69 MiB` —— **层真的搬上去了**，
+  炸的是**生成时第一次建计算管线**（不是加载、不是设备识别）。
+* E7（纯 CPU）那次的完整结论行：
+  `首字（TTFT）=76 ms` · `数值.offloaded_layers=0` ·
+  `内存[生成前]=RSS 2177 MB / RssFile 999 MB / RssAnon 1176 MB / VmSwap 24 MB · MemAvailable 2379 MB`
+
+### 16.3 ★★★ 三条结论（这一轮的"事实"，不是推测）
+
+1. ★★★ **GPU（Vulkan）在这台 Adreno 830 上用不了**：设备认得出来（`Vulkan0(Adreno (TM) 830)`）、
+   29 层也真的卸载上去了，但**驱动拒绝 q4_K 的 matvec 计算管线**。
+   `mmvq` / `fusion` / `async` / `adreno` 四个后端级旋钮**逐个 + 组合都试过，结果一模一样**。
+   ⇒ **"换哪个旋钮能让 GPU 起来"这条路到头了**，别再猜参数。
+2. ★★★ **轮次67 那条 Adreno 补丁在 830 上"无效"**：开关它（E1 vs E2）走的是两条不同的
+   SPIR-V 路径，**两次都失败**。⇒ 这条补丁**不是这台机器的解药**（在 740 上有没有用它，
+   本轮**仍然没有读数**）。
+3. ★★★ **内存不是瓶颈**（这条推翻了旧结论）：E1~E6 的 `RssFile` 都在 **1176~1244 MB**，
+   模型本体 1060 MB ⇒ **权重是常驻内存的**；E7（CPU）`VmSwap` 只有 24 MB。
+   轮次66/67 那个"`RssFile` 远小于模型 ⇒ 每吐一个字都从闪存重读、163 MB/s、6.5 秒/字"
+   **不适用这台机器**（那是 8 GB 那台旧机的读数）。
+   ⇒ 在这台机器上**关掉 GPU 用纯 CPU，decode = 22 ms/token（44.75 tok/s）** —— 已经很快了。
+
+### 16.4 ★★ 代码依据（读上游源码得到的，能解释上面那张表；两处都是**判据局限**）
+
+* `q4_K` 的 matvec 管线用的是 **`use_subgroups16`**（`ggml-vulkan.cpp:2980` 那一行的实参），
+  而 `use_subgroups16 = use_subgroups && subgroup_min_size_16 && !is_imagination_proprietary`（:2937）、
+  `subgroup_min_size_16 = (!subgroup_size_control && subgroup_size >= 16) || (subgroup_size_control && subgroup_max_size >= 16)`（:1700）。
+  这台机器 `subgroup=64` ⇒ **`subgroup_min_size_16` 为真** ⇒ 轮次67 那条补丁（改 `use_subgroups`）
+  **确实会改变 q4_K 用哪一份 SPIR-V**（所以 E1/E2 是两条路），但**两条都过不了驱动**。
+* ★★ **`pipeline->name` 是调用点传进来的固定字符串**（`ggml-vulkan.cpp:1984` `pipeline->name = name;`），
+  三个归约模式（NONE / SUBGROUP / HYBRID）**共用同一个名字**。
+  ⇒ **"失败的管线名"这一列只能定位到"哪个算子"，不能区分归约变体** ——
+  轮次66/67 把它当成"着色器变体"的证据是**过度解读**，本轮读源码才发现。
+* `GGML_VK_DISABLE_MMVQ` / `FORCE_MMVQ` 只改 `device->mmvq_mode`（:4968~4973），
+  真正决定 y 要不要量化成 q8_1 的那一行还**要求 `ctx->device->integer_dot_product` 为真**
+  （:6787 `bool quantize_y = ctx->device->integer_dot_product && … && ggml_vk_should_use_mmvq(…)`）。
+  ★ 实测 E3/E4（off / force）**管线名都没变** ⇒ 这个 build 上
+  **`integer_dot_product == false`**（NDK 自带 glslc 不支持 `integer_dot`，见第八节 8.2 的降级清单）
+  ⇒ **`mmvq` 这个旋钮在本工程当前的构建里是"惰性"的**（不是坏了，是无处可施）。
+
+### 16.5 ★★★ 本轮改了产品代码（真机实测抓到的真 bug）：本地模型面板**必须能滚**
+
+`AlertDialog` 的自定义面板（`android:id/customPanel`）**不会**自己变成可滚容器。
+在这台 1904×3040 / 440dpi 的机器上，`showLocalModelPanel()` 的内容比对话框高 ⇒ 尾部整段被裁：
+实测 a11y 树里**连 `🎛 本地推理调优` 这个文字节点都不存在**（`text="…调优…"` 匹配 0 条）
+⇒ **用户点不到**轮次71 专门交给他的 A/B 入口；「🧪 本地推理自检」也会在
+"上次开 GPU 失败"那两行出现时被顶出可视区。
+⇒ 改法（`MainActivity.showLocalModelPanel()`）：与 `showTunePanel()` 同构，
+`ScrollView` 包住 `box` + 高度上限 `0.72 × 屏高`。**一处改了另一处要连着改**。
+★ 修完实测：一次上滑就能把「🎛 本地推理调优（进阶 · A/B 用）：全是默认值 ›」滚进 a11y 树。
+
+### 16.6 ★★ 真机操作踩到的四个坑（**下一个窗口驱动真机前必读**）
+
+1. **屏幕熄灭 / 锁屏时 `am start` 起不来**：命令回 `Starting: Intent …`，
+   而 `ResumedActivity` 仍是 `com.miui.home/.launcher.Launcher`（通知栏还盖着）
+   ⇒ 每次驱动前先 `adb shell input keyevent 224`（WAKEUP）+ `adb shell wm dismiss-keyguard`。
+2. **`uiautomator dump` 会随机失败**：桌宠一直在动 ⇒ `ERROR: could not get idle state`，
+   stdout 空、`/sdcard/_r72d.xml` 还是**上一次**的内容 ⇒ 必须重试，
+   并且只把含 `<hierarchy` 的输出当成功（否则"明明在屏幕上却说找不到"）。
+3. **`adb root` 不可用**（`adbd cannot run as root in production builds`）、包也不 debuggable
+   ⇒ 私有 pref 读不到，一切只能走 UI + logcat；**`setprop debug.dsp.*` 不需要 root**（实测可用）。
+4. **对话框最后一行会被压成几像素高**（`本地推理自检` 的 TextView `bounds=[325,2694][1650,2698]`，高 4 px）；
+   而**单选列表**（`setSingleChoiceItems` 的 ListView）里的选项在 a11y 树里是
+   `clickable=false` 的 TextView ⇒ 找行要用"最小可点容器含这段文字"，点选项要直接点文字节点，
+   **两种找法不能混用**。
+
+### 16.7 ★★★ 诚实边界（**没测到什么**，别把这一轮读成"GPU 已全面可用"）
+
+* ★★★ **只有这一台机器有读数**（`25091RP04C / piano / Adreno 830 / SM8750P`）。
+  简报里提到的那台 **2210132C / nuwa / Adreno 740 本轮不在线 ⇒ 0 条读数**；
+  ★ **联发科（Mali）一台都没验过**（仍然）。
+* ★★★ **没试的旋钮**：`flash attention`、`n_ubatch`、`mlock`、`loadmode` 这四个**载入级**
+  旋钮在 GPU 那条路上**一个都没试**（它们不改"用哪条 SPIR-V"，理论上救不了被拒的管线，
+  但这是**推断**不是实测）；`adreno` 只试了 auto / subgroup 两档（旋钮只有这两档），
+  是**用 `setprop debug.dsp.adreno_subgroup` 走的**（等价于旋钮的 subgroup 档）。
+* ★ **E7（纯 CPU）的 44.75 tok/s 是"8 tok 提示 + 24 token 生成"的短程读数**
+  （自检的固定协议），**不代表长文生成的速度**；而且那次 `mmvq=force` 还残留着
+  （对纯 CPU 无影响，但严格说不是"全默认"档）。
+* ★ **GPU 失败的确切驱动原因没查到**：只知道 `VkDevice::createComputePipeline` 返回
+  `VK_ERROR_UNKNOWN`。**没试**换 glslc / 换 llama.cpp 版本 / 换 `-DGGML_VULKAN_...` 编译选项
+  （轮次67 已证伪"换 glslc"这条路：两个版本的 SPIR-V 逐字节相同）。
+* ★ 自检的"快 / 慢"阈值（3000 / 1000 ms per token）**是常量**，不是实测分界线。
+
+### 16.8 ★★★ 轮次72 收尾：真机上抓到的**两个报告缺陷**（都已修 · 反向项 CU~DB 钉着）
+
+★ 这一节是**收尾轮**补的：16.2 那张读数表是用**旧报告格式**跑出来的，而旧格式本身有两个缺陷。
+
+1. ★★★ **`-1`（"这一步没跑到"的哨兵）被当数字印**。失败档的报告里原本是：
+   ```
+   prefill=8 tok / -1 ms (0.00 tok/s)
+   decode=0 tok / -1 ms (0.00 tok/s, -1 ms/token)
+   首字（TTFT）=-1 ms / 总耗时=-1 ms / 载入耗时=-1 ms
+   ```
+   —— 读报告的人（以及下一个窗口）会从这一行**读出一个不存在的读数**
+   （"-1 ms 的耗时"，或者把 `0.00 tok/s` 读成"跑了但极慢"），
+   而这一屏正是要发给别人看的那一份。
+   ⇒ `jni/dspllm_jni.cpp` 新增三个小工具：
+   * `ms_text(double)` ⇒ 没测到就返回 **`未测到（这一步没跑到）`**（载入那处是 `未测到（还没载入）`）；
+   * `tok_s_text(int,double)` ⇒ **没测到耗时就不印 tok/s**（`0.00 tok/s` 会被误读成"极慢"）；
+   * `faults_text(long,long)` ⇒ 页错误的 `-1` 也不再印成 `+-1`，而是 `（没采到）`。
+   ★ 真机验证（同一台机器、GPU 档失败那一次）现在印的是
+   `prefill=8 tok / 未测到（这一步没跑到）` 与
+   `页错误=prefill 段 （没采到） · decode 段 （没采到）`。
+   ★ 判据是**结构性的**：整份报告里不许出现 `-1 ms`（反向项 CU / CV / CW）。
+
+2. ★★★ **自检结论里有一条会撒谎的判据**（比上面那条严重）。
+   `LocalSelfTest.verdict()` 原来只按 `数值.has_vulkan_gpu` 判"GPU 到底用没用上"。
+   而真机 E7 是：**档位=关**、`数值.has_vulkan_gpu=1`（设备清单里确实有
+   `Vulkan0(Adreno (TM) 830)`）、**`数值.offloaded_layers=0`**（一层都没交给它）、
+   纯 CPU 跑出 22 ms/token ⇒ 旧判据会印出「✅ **GPU 真的用上了**」
+   —— **那就是把"纯 CPU 很快"写成"GPU 加速成功"**，正是本轮诚实条款明令禁止的那句话。
+   ⇒ 判据改成 **`数值.offloaded_layers > 0`**（层**真的**交上去了才叫 GPU 在用）；
+   结论写成「✅ 跑起来了：decode = 22 ms/token —— 这次是**纯 CPU**（**0 层**交给 GPU，
+   虽然这台机器认得出 Vulkan 设备）」，再接一句**可执行建议**
+   （常量 `CPU_RECOMMEND` = `★ 建议这台机器把「⚡ GPU 加速」设成「关」（纯 CPU）`），
+   【下一步】里也重复一次 —— **用户看不懂 logcat，要一眼看到"该怎么办"**。
+   ★ 认不出 `offloaded_layers` 那一行时**不许下结论**（写"无法确认 GPU 到底有没有用上"）。
+   ★ 反向项 CX / CY / CZ / DA 盯着这几条。
+
+3. ★★ **E7 复现（收尾轮实测）**：同一台机器、同一个模型、同一套自检协议
+   ⇒ **decode 24 tok / 535 ms = 44.84 tok/s（22 ms/token）**、`数值.offloaded_layers=0`、
+   `RssFile 943 MB`（模型 1060 MB）、`VmSwap 24 MB`
+   ⇒ **与 16.2 表里 E7 的 44.75 tok/s / 22 ms/token 同一量级、可重复**。
+   ★ 读数原文：`build/_r72/verify72_results.txt`、`build/_r72/e7_repro.log`。
+
+4. ★★ **收尾轮的库体积**：`libdspllm.so` **88,344 → 92,040** 字节
+   （多的是上面那三个小工具与新的文案），其余 6 个库**逐字节相同**，编译**零警告**。
+   ★ APK **dev 56.7 MB / rel 56.9 MB**；dex **dev `ebbdf5da…` / rel `726781cc…`**。
+
+5. ★★ **面板那个 bug 的真机验收方式**（写给下一个窗口）：
+   `build/_r72/verify72.py panel` —— 它进「🤖 本地模型」面板、dump a11y 树，断言
+   ① 面板里有 `android.widget.ScrollView` 且高度 < 整屏；② 上滑之后可见文字**变了**；
+   ③ **`🎛 本地推理调优` 节点可达**（这就是那个 bug 的原文症状：
+   修之前它在 a11y 树里**根本不存在**）。`python build/_r72/verify72.py e7` 复现 E7。
+   ★ 实测那个 ScrollView 渲染出来高 **2493 px**（wm size 1904×3040 的 0.82）——
+   源码里的上限是 `0.72 × getDisplayMetrics().heightPixels`，两个量**不是一回事**
+   （对话框可用区也不同）⇒ 真机这一侧只判"**确实被限高**"，不假装它就是 0.72。
+
+
+================================================================================================
+十五、轮次73：第四条本地补丁（第三档归约 / HYBRID）+ 设备级 fp16 旋钮
+================================================================================================
+
+★ 这一轮**改了 llama.cpp 一行**（第四个本地补丁）⇒ 重编 ggml-vulkan 时必须重打。
+
+15.1 第四条本地补丁（`ggml/src/ggml-vulkan/ggml-vulkan.cpp`）
+------------------------------------------------------------------
+在 `ggml_vk_get_dequantize_mul_mat_vec()` 的 workgroup 启发式之后加：
+
+    if (getenv("GGML_VK_ADRENO_HYBRID") != nullptr && ctx->device->vendor_id == 0x5143u) {
+        dmmv_wg = DMMV_WG_SIZE_LARGE;
+        GGML_LOG_INFO("ggml_vulkan: Adreno HYBRID 生效：dmmv_wg=LARGE（a_type=%d m=%u k=%u）"
+                      " ⇒ 期望归约模式 = HYBRID（_subgroup_no_shmem）\n", (int) a_type, m, k);
+    }
+
+**为什么**：q4_K matvec 有三条 SPIR-V 变体（`arr_dmmv_q4_k_f32_f32[3]`）：
+`reduc16 = (use_subgroups16 && w == SUBGROUP) ? SUBGROUP
+         : (use_subgroups16 && w == LARGE)    ? HYBRID : SHMEM`
+而 `dmmv_wg` 在 Qualcomm 上**永远是 SUBGROUP**（上游只给 NVIDIA/Intel 选 LARGE）
+⇒ **HYBRID（`_subgroup_no_shmem`）在 Adreno 上从来没被选到过**。
+轮次72 只测了 SHMEM 与 SUBGROUP（都失败）⇒ 第三条是唯一没试过的。
+★ 变量没设时行为与上游**逐字相同**（默认路径零影响）。
+
+另外在 `ggml_vk_load_shaders()` 里 `use_subgroups16` 定义之后加了一行**诊断日志**
+（`Adreno HYBRID 检查：use_subgroups=… ⇒ use_subgroups16=…`）——
+因为三条变体的 `pipeline->name` 完全相同，日志里不打出选了哪一档，
+"第三档试过了"就只是说法、不是证据。
+
+15.2 ★★★ 重编 ggml-vulkan 时**必须**加这个 include（本轮踩到的坑）
+------------------------------------------------------------------
+`build-arm64-vk2` 这个 build 目录的 `Vulkan_INCLUDE_DIR` 指向 NDK sysroot，
+而 sysroot 里**只有 `vulkan.h`、没有 `vulkan.hpp` 与 `spirv/unified1/spirv.hpp`**
+⇒ 直接 `cmake --build` 会报 `fatal error: 'vulkan/vulkan.hpp' file not found`。
+两个头文件包都在本机（`D:\vk_headers`、`D:\spirv_headers`），
+`D:\spirv_headers\install\include` 里**同时**有 `vulkan/` 与 `spirv/`。做法：
+
+    set PATH=D:\Android\Sdk\cmake\3.31.6\bin;%PATH%
+    cmake -S D:\llamacpp_src\llama.cpp-b76b13379d3b7d67ab0bc424516bb6fd2522bd8e ^
+          -B D:\llamacpp_src\build-arm64-vk2 ^
+          "-DCMAKE_CXX_FLAGS=-isystem D:/spirv_headers/install/include"
+    cmake --build D:\llamacpp_src\build-arm64-vk2 --target ggml-vulkan --parallel 12
+
+★ 用 `-DVulkan_INCLUDE_DIR=…` **不行**：重新 configure 时 `find_package(Vulkan)` 会把它
+改回 sysroot（本轮实测两次），必须走 `CMAKE_CXX_FLAGS`。
+然后 strip 再拷进工程（否则 APK 里是 31.8 MB 的未 strip 版）：
+
+    D:\Android\Sdk\ndk\27.2.12479018\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-strip.exe ^
+        --strip-unneeded D:\petbuild\lib\arm64-v8a\libggml-vulkan.so
+
+15.3 本轮的库体积（实测）
+------------------------------------------------------------------
+* `libggml-vulkan.so` **19,973,416 → 19,974,184** 字节（+768：两行日志字符串）；
+* `libdspllm.so` **92,040 → 93,080** 字节（+1040：hybrid/f16 的解析、setenv、文案）；
+* 其余 6 个库**逐字节相同**；编译**零警告**。
+* ★ 未 strip 的构建产物：`build/_r73/libggml-vulkan.so.unstripped-r73`；
+  本轮之前的旧库备份：`build/_r73/libggml-vulkan.so.before-r73`。
+
+15.4 真机 A/B 读数（同一台 25091RP04C / Adreno 830 / Qwen2.5-1.5B Q4_K_M）
+------------------------------------------------------------------
+| 档位 | 结果 | 关键证据 |
+|---|---|---|
+| A0 全默认（GPU 开） | ❌ | `compute pipeline creation failed for mul_mat_vec_q4_k_f32_f32` |
+| A1 `adreno=hybrid` | ❌ | `Adreno HYBRID 检查：use_subgroups=1 … ⇒ use_subgroups16=1` + `Adreno HYBRID 生效：dmmv_wg=LARGE`（**第三档确实选到了**），同一条管线仍被拒 |
+| A2 `f16=off`（adreno=auto） | ❌ | `Vulkan 半精度（fp16）＝关（GGML_VK_DISABLE_F16=1）`，报错逐字相同 |
+| A2b `adreno=hybrid` + `f16=off`（组合） | ❌ | 同上 |
+
+⇒ **三条归约变体全部失败**（SHMEM / SUBGROUP / HYBRID），fp16 也救不了。
+★ 读数原文：`build/_r73/ab73_results.txt`、`build/_r73/selftests73/*.log`。
+★ **仍然没试过**：`flash` / `ubatch` / `mlock` / `loadmode` 这四个**载入级**旋钮在 GPU 路上
+（它们不改"用哪条 SPIR-V"，机制上救不了建管线失败 —— 这是推断，不是实测）。
+★ 小米 13（2210132C / nuwa / Adreno 740）**这一轮又没连上**（连上的是 25091RP04C）；
+联发科一台都没验过。
+
+
+================================================================================================
+十六、轮次74：**运行时自动检测硬件 → 动态算 n-gpu-layers → 自动降级**
+================================================================================================
+
+★ 这一轮**没有改 llama.cpp**（第四条本地补丁原样保留）；改的是 JNI + Java。
+★ 用户原话：「核心思路：运行时自动检测硬件 → 动态计算 -(n-gpu-layers)
+→ 自动降级兜底不用用户手动调参数。」
+
+16.1 JNI 新增：`nativeDeviceInfo()`（两套包名都有）
+------------------------------------------------------------------
+`device_info_text()`（`dspllm_jni.cpp`，紧挨着 `g_backend_inited`）：
+
+* 第一次调用时 `llama_backend_init()`（与 `do_load_locked` 同一个入口，只做一次），
+  然后 `ggml_backend_dev_count()` 枚举设备，取第一个 GPU/IGPU 的
+  **description**（`Adreno (TM) 830`；`name` 是后端名 `Vulkan0`，不是机型）
+  与 `ggml_backend_dev_memory()` 的 free/total；
+* 返回一行自描述串：
+  `vulkan=1;count=1;name=Adreno (TM) 830;backend=Vulkan0;vram_free=15252;vram_total=15252;subgroup=0`
+* ★★ **调用方必须是后台线程**（Vulkan 枚举在部分机型上要几十~几百毫秒）；
+* ★ 少一套包名的转发 ⇒ 正式版的"自动"永远以为没有 GPU（直接纯 CPU，不报错）。
+
+16.2 Java 侧新增
+------------------------------------------------------------------
+* `GpuPlan.java`（**纯类**，零 Android 依赖）：`decide(Facts)` → `Plan`；
+  `degrade(Plan)`；`looksLikeGpuFailure(String)`；`summary` / `reportLines`。
+  规则：没有 Vulkan ⇒ CPU；已知坏机型（Adreno 830，实测）⇒ CPU；
+  否则 `每层 = modelBytes / layers`、`预算 = availRam × 55%（≤3072 MB）`、
+  `ngl = 预算 / 每层`；放得下 1/3 以上才用 GPU（部分卸载往往更慢）。
+* `LocalHardware.java`：取数 + 缓存（`LocalLlm.deviceInfo()` / ActivityManager / `ModelFile.ggufLayerCount`）。
+* `ModelFile.ggufLayerCount(byte[] / File)`：只读 GGUF **前 64 KB**，扫 `<arch>.block_count`；
+  读不到返回 0（调用方必须当"不知道"，用 `EST_LAYERS=32` 估算并标 `estLayers`）。
+* `GpuMode`：加回 `AUTO` 并设为默认；`allowCpuFallback(auto)=true`，`on/off=false`。
+* `LocalChat`：`loadPlanned()` 统一载入（计划 → load → 自动档失败则降级重载一次）；
+  `reloadCpu()` 给**生成阶段**的降级用（真机上 GPU 就炸在建计算管线）；
+  降级原因记进 `LocalHardware.noteFallback()`（面板 + 自检报告都能看见）。
+* `LocalSelfTest.compose(..., autoLines)`：报告多两行 `自动计划=` / `硬件=`。
+
+16.3 库体积（实测）
+------------------------------------------------------------------
+* `libdspllm.so` **93,080 → 94,720** 字节（+1640：`device_info_text` 与两套导出）；
+* `libggml-vulkan.so` **未变**（19,974,184 字节；这一轮没动 ggml）；
+* 其余 6 个库**逐字节相同**；编译**零警告**。
+
+16.4 诚实边界
+------------------------------------------------------------------
+* 已知坏机型名单**只有 Adreno 830**（轮次72/73 实测）；别的机型会**先试** GPU，失败再降级。
+  这不是"所有 Adreno 都不行"；
+* 层数靠 GGUF 头读；读不到就是**估算**（32 层）—— 报告里标 `（估算）`，不许装成读到了；
+* 降级只降**一次**（GPU → CPU），不会来回弹；
+* 「开」是手动对照档：失败**不降级**（否则 A/B 就没法做）；
+* 真机验收（自动档 → 纯 CPU + 硬件探测日志）在 `build/_r74/`（★ 那一轮设备**反复掉线**，
+  若 `ab74_results.txt` 缺失 = 没跑成，别把"没跑"读成"跑过了"）。
+
+
+
+

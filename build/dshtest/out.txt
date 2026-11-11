@@ -1,0 +1,151 @@
+=== DSH 内核断言（纯 Java，无 Android）===
+
+[1] DshJson 写入与转义
+  [OK]   字符串转义 :: "a\"b\\c\nd"
+  [OK]   控制字符走 \u00XX :: "\u0001"
+  [OK]   整数不带小数点 :: 42
+  [OK]   浮点去尾零 :: 0.5
+  [OK]   布尔 :: true
+  [OK]   null :: null
+  [OK]   map 保持插入顺序 :: {"b":2,"a":"x"}
+  [OK]   list :: [1,"two"]
+  [OK]   超长截断带省略号
+
+[2] DshPolicy 权限档与路径沙箱
+  [OK]   档名往返 :: workspace-write
+  [OK]   认不出的档退回可写（保守） :: workspace-write
+  [OK]   只读档不许 write
+  [OK]   只读档允许 read
+  [OK]   可写档允许 write
+  [OK]   未知工具按需最高档（默认拒绝）
+  [OK]   相对路径解析 :: /data/user/0/com.deepseek.pet/files/dsh/notes/a.txt
+  [OK]   点斜杠归一 :: /data/user/0/com.deepseek.pet/files/dsh/notes/a.txt
+  [OK]   沙箱内 .. 归一 :: /data/user/0/com.deepseek.pet/files/dsh/a.txt
+  [OK]   ★ 路径穿越被挡住（../../）
+  [OK]   ★ 沙箱外的绝对路径被挡住
+  [OK]   空路径被挡住
+  [OK]   display 去掉前缀 :: notes/a.txt
+
+[3] 工具注册表 / 权限闸 / 参数解析
+  [OK]   标准套件注册了 7 个工具
+  [OK]   工具名可查
+  [OK]   未知工具是错误结果（不抛）
+  [OK]   坏参数是错误结果
+  [OK]   缺必填参数说清楚
+  [OK]   写文件成功
+  [OK]   读回来带行号
+  [OK]   列目录能看到 notes
+  [OK]   ★ 只读档拒绝写，且说明当前档
+  [OK]   ★ 越界读被挡住
+  [OK]   todo 落盘并读回
+  [OK]   todo.json 真的写到了沙箱
+  [OK]   HTML→文本：去标签留正文
+  [OK]   HTML→文本：块级标签换行
+  [OK]   HTML→文本：script 内容被丢掉
+  [OK]   HTML 实体解码 :: a<b>&c
+  [OK]   整数参数容忍字符串 :: 7
+
+[4] 技能（SKILL.md 解析与注入块）
+  [OK]   建目录
+  [OK]   扫到 1 个技能 :: 1
+  [OK]   name 解析 :: android-dev
+  [OK]   description 解析
+  [OK]   正文不含 front-matter
+  [OK]   按名字查找 :: android-dev
+  [OK]   注入块含 system-reminder
+  [OK]   注入块含技能名与描述
+  [OK]   注入块明确说正文未加载
+  [OK]   无技能时注入块为空 :: 
+
+[5] 会话事件与投影
+  [OK]   事件数（session/sandbox/turn/step×2/msg×3/tool×2/end×3） :: 13
+  [OK]   首事件是 session :: session
+  [OK]   seq 连续（最后一条 = 条数-1） :: 12
+  [OK]   投影条数（system+user+assistant+tool+assistant） :: 5
+  [OK]   第一条是 system :: system
+  [OK]   system 用传入的提示 :: SYSTEM
+  [OK]   第二条是 user :: user
+  [OK]   assistant 带 1 个 tool-call :: 1
+  [OK]   tool-call 名字 :: read
+  [OK]   tool 结果消息的 callId :: call_1
+  [OK]   tool 结果正文还原
+  [OK]   最后一条 assistant 正文 :: 文件里写着「你好 世界」。
+
+[6] DshWire 请求编码 / 响应解码
+  [OK]   请求体带模型名
+  [OK]   请求体带 tools
+  [OK]   请求体带 tool_choice
+  [OK]   请求体带 max_tokens 与 temperature
+  [OK]   assistant 的 tool_calls 编码
+  [OK]   tool 消息带 tool_call_id
+  [OK]   required 里只有必填项
+  [OK]   空 tools 时不带 tools 字段
+  [OK]   正常响应解析成功
+  [OK]   思维链单独取 :: 想想
+  [OK]   正文为空 :: 
+  [OK]   工具调用 1 个 :: 1
+  [OK]   工具名 :: read
+  [OK]   调用 id :: c9
+  [OK]   prompt token :: 11
+  [OK]   错误体识别
+  [OK]   非 JSON 响应不抛
+  [OK]   ★ arguments 给对象时也能收下
+  [OK]   无名工具调用被丢弃（不炸）
+
+[7] token 计量与上下文压缩
+  [OK]   中文 1 token/字 :: 4
+  [OK]   英文约 4 字符/token :: 2
+  [OK]   空串 0 :: 0
+  [OK]   工具声明也算 token
+  [OK]   预算 = 窗口×70% − 预留
+  [OK]   超预算时剪工具结果
+  [OK]   剪后正文显著变短
+  [OK]   剪后仍标明省略了多少
+  [OK]   剪后落在预算内（或已尽力）
+  [OK]   丢掉了最老的消息
+  [OK]   插入了压缩说明
+  [OK]   ★ tool_calls 与 tool 结果数量仍成对 :: 5
+  [OK]   预算充足时零改动
+
+[8] 会话日志（追加 / 回放 / 坏行容忍）
+  [OK]   事件都推给了 Sink :: 7
+  [OK]   日志文件已生成
+  [OK]   回放事件数 :: 7
+  [OK]   回放第一条类型 :: session
+  [OK]   回放保留 data :: hi
+  [OK]   重开会话事件数一致 :: 7
+  [OK]   重开后 seq 会接着往上编
+  [OK]   ★ 坏行被跳过，其余事件仍可读 :: 7
+  [OK]   会话 id 文件名安全化 :: a_b
+  [OK]   空 id 兜底 :: unnamed
+  [OK]   列表里能看到会话
+  [OK]   meta.json 落盘
+
+[9] agent loop 五条分支
+  [OK]   ① 无工具：成功
+  [OK]   ① 步数 = 1 :: 1
+  [OK]   ① 事件里有 turn/start 与 turn/end
+  [OK]   ① 请求体带 tools
+  [OK]   ① 请求体带 system 提示
+  [OK]   ② 两步后成功
+  [OK]   ② 步数 = 2 :: 2
+  [OK]   ② 文件真的写出来了
+  [OK]   ② 工具结果落盘成事件
+  [OK]   ② 第二次请求带上了工具结果
+  [OK]   ③ 工具报错不毁掉整轮
+  [OK]   ③ 第二次请求里带的是错误正文
+  [OK]   ④ 撞上限：不算成功
+  [OK]   ④ 步数 = maxSteps :: 4
+  [OK]   ④ 上限原因写清楚
+  [OK]   ⑤ 异常被兜住并给出原因
+  [OK]   ⑤ 失败也落了 error 事件
+  [OK]   ⑤ 失败路径也补了 turn/end :: turn/end
+  [OK]   ⑥ 只读档下第二次请求里带权限不足
+  [OK]   ⑥ 文件确实没被写出来
+  [OK]   ⑦ 提示里有人格铁律
+  [OK]   ⑦ 提示里有工作区与权限档
+  [OK]   ⑦ 提示里有技能清单
+  [OK]   ⑦ 提示里列了工具名
+  [OK]   ⑦ 只读档的说明措辞不同
+
+DSH-CORE OK (130 项)

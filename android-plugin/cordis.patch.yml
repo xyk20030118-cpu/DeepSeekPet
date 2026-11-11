@@ -1,0 +1,47 @@
+# Android profile patch: native-module entries (koffi / sharp / node-pty) are disabled
+# and replaced by the three providers in ./android/*.mjs
+# NOTE: patch targets entry ids, not package names.
+- id: attachment-local
+  disabled: true
+- id: attachment
+  disabled: true
+- id: subprocess
+  disabled: true
+- id: sandbox
+  disabled: true
+- id: bash
+  disabled: true
+- id: pwsh
+  disabled: true
+- id: terminal
+  disabled: true
+- id: terminal-bash
+  disabled: true
+- id: code-runtime
+  disabled: true
+- id: code-runtime-worker-thread
+  disabled: true
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-bash-persistent
+  disabled: true
+- id: tool-pwsh-persistent
+  disabled: true
+- id: jobs
+  disabled: true
+- id: jobs-local
+  disabled: true
+- id: win32-process
+  disabled: true
+- id: sandbox-windows-acl
+  disabled: true
+
+- insert:
+    - id: subprocess-android
+      name: './android/subprocess.mjs'
+    - id: sandbox-android
+      name: './android/sandbox.mjs'
+    - id: attachments-android
+      name: './android/attachments.mjs'
